@@ -109,3 +109,11 @@ Set `LUHUI_DATA` (legacy `GELU_DATA` still honoured) to move the data root.
 
 Open an [issue](../../issues) with your Windows version, player version/commit, the file's container/codec
 (visible in `mpv.log`), and reproduction steps. `data\logs\crash.log` is essential for "it closed itself" reports.
+
+---
+
+## More from the same author
+
+- [LuHui Music Player](https://github.com/gedouluhui/luhui-music-player) — WinUI 3 shell + WASAPI exclusive-mode music player
+- [Fanqie Alarm](https://github.com/gedouluhui/fanqie-alarm) — a Pomodoro timer that is one HTML file
+- [pc-phone-proxy](https://github.com/gedouluhui/pc-phone-proxy) — auto-selecting proxy for Windows and Android

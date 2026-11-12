@@ -546,3 +546,11 @@ mpv、FFmpeg、Qt、Noto 字体的许可见 `THIRD_PARTY_NOTICES.md`。
 
 提 [Issue](../../issues) 时请附：Windows 版本、播放器版本（或 commit）、片子的容器/编码
 （`mpv.log` 里能看到）、复现步骤。能附 `data\logs\crash.log` 最好——"突然没了"这类问题没有它就查不动。
+
+---
+
+## 同作者的其他项目
+
+- [LuHui音乐播放器](https://github.com/gedouluhui/luhui-music-player) —— WinUI 3 + WASAPI 独占的本地音乐播放器
+- [番茄闹钟](https://github.com/gedouluhui/fanqie-alarm) —— 整个应用就是一个 HTML 的番茄钟
+- [pc-phone-proxy](https://github.com/gedouluhui/pc-phone-proxy) —— 电脑 + 安卓双端自动选线代理
