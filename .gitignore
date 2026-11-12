@@ -1,0 +1,46 @@
+# ---- 本机用户数据 / 运行产物（绝不入库） ----
+data/
+截图/
+dist/
+build/
+__pycache__/
+*.py[cod]
+app.backup-*/
+.qoder-credits/
+
+# ---- 生成的启动器（内含本机绝对路径）----
+*.bat
+*.exe
+packaging/launcher.cs
+packaging/open_file.py
+packaging/reg/*.reg
+packaging/reg/legacy/
+
+# ---- 播放内核与随包运行时（体积大、按 README 自行下载）----
+runtime/
+
+# ---- 测试现场（日志、截图、临时数据、样片视频）----
+tests/out/
+tests/logs/
+.selftest-data*/
+tests/.selftest*/
+tests/.probe*/
+tests/.preview*/
+tests/.fs-offline*/
+tests/.falsify-burst/
+tests/.scrollapp/
+*.mp4
+*.mkv
+*.wav
+*.avi
+*.mov
+
+# ---- 内部交账与临时凭据 ----
+docs/交账-*.md
+.gh_pat_tmp
+
+# ---- 编辑器 / 系统杂物 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
