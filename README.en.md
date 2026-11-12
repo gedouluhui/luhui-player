@@ -11,6 +11,8 @@
 A local video player for Windows: **mpv does the decoding, a hand-drawn PyQt5 shell does the UI.**
 No Electron, no web view, no network, no DRM, no telemetry.
 
+![Playback, picture panel, seek](docs/images/demo.gif)
+
 ![Home](docs/images/home.png)
 
 ## Why another player
