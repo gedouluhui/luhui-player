@@ -1,5 +1,7 @@
 # LuHui播放器（LuHui Player）
 
+**中文** · [English](README.en.md)
+
 **Windows 本地视频播放器 —— mpv 解码内核 + PyQt5 自绘 Fluent 外壳。**
 
 <p>
