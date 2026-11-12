@@ -22,16 +22,28 @@
 git clone https://github.com/gedouluhui/luhui-player.git
 cd luhui-player
 python -m pip install PyQt5
-:: 把 mpv.exe 放进 runtime\mpv\，把 ffmpeg.exe 放进 runtime\ffmpeg\（可选，仅 GIF 与缩略图）
+
+:: 播放必需（缺一不可，源码运行也要有）：
+::   runtime\mpv\mpv.exe            ← 解码内核
+::   runtime\mpv\mpv\fonts.conf     ← 内核的字幕字体配置（打包清单同样硬检查这一份）
+
+:: 只有 GIF 导出与时间轴缩略图才需要（不装照样能播）：
+::   runtime\ffmpeg\ffmpeg.exe
+
 python -m app.main
 ```
 
-需要 Windows 10/11 64 位与 Python 3.9+（开发机 3.12.3）。打包成双击即用的文件夹：
+需要 Windows 10/11 64 位与 Python 3.9+（开发机 3.12.3）。打包成双击即用的文件夹
+（打包器是单独的一步，源码运行不需要它）：
 
 ```bat
+python -m pip install pyinstaller
 python -m PyInstaller packaging/portable.spec --noconfirm
 ```
 
+`portable.spec` 在开打之前会逐项检查 `runtime\` 里的 `mpv.exe`、`mpv\fonts.conf`、
+`ffmpeg.exe`（以及仓库自带的 `packaging\assets\`），缺哪份就报 `缺少打包资源：<路径>`
+并停下——**ffmpeg 在播放时可省，但便携包清单里是必需项**（工坊与缩略图要用它）。
 产物在 `dist\LuHui播放器\`，双击 `LuHui播放器.exe` 即可。
 
 ---
@@ -334,14 +346,19 @@ python -m app.doctor --falsify   :: 开发者用：喂已知坏数据，每条�
 
 ```
 runtime\mpv\mpv.exe            ← 必需，缺它完全放不了片
+runtime\mpv\mpv\fonts.conf     ← 必需，内核渲染字幕时的 Fontconfig 配置
+                                 （就是 Fontconfig 的标准模板，占位符 WINDOWSFONTDIR /
+                                 WINDOWSUSERFONTDIR 原样别改；打包清单硬检查这一份）
 runtime\ffmpeg\ffmpeg.exe      ← 可选，只影响 GIF 导出与时间轴缩略图
+                                 （打包成便携版时必需：portable.spec 会检查它）
 ```
 
 本项目当前用的是 mpv v0.41.0-1101 与 FFmpeg N-127213（官方 CI 构建，sha256 对过 release 清单）。
 `python -m app.doctor` 会直接告诉你它们在不在、跑不跑得通。
 
-源码仓库不提交这两个 exe（体积与许可原因），自行下载官方构建放入即可：
+源码仓库不提交这些运行时文件（`.gitignore` 把整个 `runtime\` 排除在外），自行准备放入即可：
 mpv 见 https://mpv.io/installation/ ，FFmpeg 见 https://ffmpeg.org/download.html 。
+`fonts.conf` 用 Fontconfig for Windows 自带的那份标准模板，原样放进 `runtime\mpv\mpv\`。
 
 ---
 

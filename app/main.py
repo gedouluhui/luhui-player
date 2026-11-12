@@ -456,11 +456,18 @@ class Handoff:
         return "queued"
 
     def attach(self, win) -> None:
+        """装配完补交排队的那几批。**回执只在真落地之后发**：`_deliver` 返回失败
+        （窗口刚销毁／add_paths 抛）时这批要放回队列——2026-11-12 审查 B4 的现场是
+        旧写法不看返回值直接 `_ack`，第二个实例收到"成功"就退了，主窗口什么也没拿到。
+        拿不到回执的发送方会自己开窗口，所以这里的正确动作是沉默并保留。
+        """
         self.win = win
         due, self.pending = self.pending, []
         for nonce, kept, dropped, sock in due:
-            self._deliver(kept, dropped)
-            self._ack(sock, nonce)
+            if self._deliver(kept, dropped):
+                self._ack(sock, nonce)
+            else:
+                self.pending.append((nonce, kept, dropped, sock))
 
 
 def listen(handoff: Handoff, key: str | None = None) -> QLocalServer | None:

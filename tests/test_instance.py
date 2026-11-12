@@ -124,6 +124,14 @@ class FakeWin:
         self.dropped.append(list(dropped))
 
 
+class BrokenWin(FakeWin):
+    """窗口接不住的那一瞬：`add_paths` 抛（真实现里是 C++ 对象已销毁的 RuntimeError）。"""
+
+    def add_paths(self, paths, replace=True):
+        self.calls.append("add_paths")
+        raise RuntimeError("窗口正在销毁")
+
+
 def pump(ms: int = 30) -> None:
     t = time.time()
     while time.time() - t < ms / 1000.0:
@@ -183,25 +191,42 @@ class SilentServer:
             return
         c.setParent(self.srv)                        # 同一条教训：不挂父随时可能被回收
         self.keep.append(c)
+        # 闭包只许捕获**值**，不许碰 `self`（2026-11-13 实发，rc=127 静默 abort）：
+        # close() 之后实例离开 SERVERS，循环引用被 GC 终结时会清空 __dict__，而管道里
+        # 可能还排着 readyRead/disconnected —— PyQt 把信号递进已终结的对象，读 self.hold
+        # 就抛 AttributeError；槽里的异常 PyQt 直接 qFatal，整份证伪连一行都不多打。
+        # 根因留档：C:/tmp 那次的 hook 日志是 'SilentServer' object has no attribute 'hold'。
+        got, hold, ack, read = self.got, self.hold, self.ack, self.read
 
         def d():
             data = bytes(c.readAll().data())
             if data:
-                self.got.append(data)
-            if self.hold:
+                got.append(data)
+            if hold:
                 return                                # 活着、收下了、就是不回话
             if c.atEnd():
-                if self.ack:
-                    c.write(QByteArray(self.ack))    # QByteArray 只吃 bytes，喂 str 会抛→整进程 abort
+                if ack:
+                    c.write(QByteArray(ack))          # QByteArray 只吃 bytes，喂 str 会抛→整进程 abort
                     c.flush()
                     pump(20)
                 c.close()
 
-        if self.read:
+        if read:
             c.readyRead.connect(d)
             c.disconnected.connect(d)
 
     def close(self):
+        # 断干净再放：挂着的信号是"close 之后还往旧对象里递事件"的唯一来源。
+        try:
+            self.srv.newConnection.disconnect(self.on_new)
+        except BaseException:
+            pass
+        for c in self.keep:
+            for sig in (c.readyRead, c.disconnected):
+                try:
+                    sig.disconnect()
+                except BaseException:
+                    pass
         try:
             self.srv.close()
         except BaseException:
@@ -533,6 +558,29 @@ def j_queued_then_attach() -> tuple[bool, str]:
             f"返回={ok} 排队={h.pending_count} → attach 后送达={w.added} 动作顺序={w.calls}")
 
 
+def j_attach_fail_no_ack() -> tuple[bool, str]:
+    """attach 补交时窗口接不住：**不许回执**，那一批要留在队列里等下一次 attach。
+
+    2026-11-12 审查 B4：`attach()` 不看 `_deliver` 的返回值，投递失败照样 `_ack`——
+    发送方（第二个实例）收到"成功"就退出，主窗口什么也没拿到，用户看到的就是"双击没反应"。
+    发送方拿不到回执会自己开窗口，所以这里唯一的正确动作是沉默并保留排队。
+    """
+    h = M.Handoff()
+    srv = HandoffServer(h)                    # 先无窗口：这一批会进 pending
+    w = BrokenWin()
+    QTimer.singleShot(250, lambda: h.attach(w))   # 装配完那一刻补交，但窗口接不住
+    t0 = time.time()
+    try:
+        ok = M.forward_to_running([VID], key=srv.key, ack_ms=1200, pump=APP.processEvents)
+        dt = time.time() - t0
+    finally:
+        srv.close()
+    kept = h.pending_count
+    return (ok is False and kept == 1, 
+            f"返回={ok} 耗时={dt:.2f}s 队列保留={kept} 窗口动作={w.calls}"
+            f"（返回 True 就是把「没落地」报成了「已送达」；队列变 0 就是把这批文件弄丢了）")
+
+
 def j_dropped_travel() -> tuple[bool, str]:
     """转交成功时，"这一趟丢掉的参数"也要跟着过去，由已经开着的窗口说给人听。"""
     h = M.Handoff()
@@ -745,6 +793,7 @@ ITEMS = [
     ("转交协议", "回执 nonce 对不上 → 判否", j_wrong_nonce),
     ("转交协议", "回执 nonce 对得上 → 判真，且窗口真收到", j_right_nonce),
     ("转交协议", "窗口没装配完时排队，attach 后一条不少，回执等真落地", j_queued_then_attach),
+    ("转交协议", "attach 补交时窗口接不住 → 不回执、这批留在队列（B4）", j_attach_fail_no_ack),
     ("转交协议", "转交时丢档原因跟着过去，由已开的窗口说", j_dropped_travel),
     ("转交协议", "同一 nonce 重投只生效一次", j_nonce_once),
     ("转交协议", "接收端连接 socket 挂父（六投六达 + 源码）", j_socket_held),
@@ -817,6 +866,27 @@ def probe_nonce_twice() -> int:
     h.receive("same", [VID], [], None)
     h.receive("same", [VID], [], None)
     return len(w.added)
+
+
+def old_attach_acks_anyway(self, win) -> None:
+    """审查 B4 的旧写法：不看 `_deliver` 的返回值，投递失败也回一句"成功"。"""
+    self.win = win
+    due, self.pending = self.pending, []
+    for nonce, kept, dropped, sock in due:
+        self._deliver(kept, dropped)
+        self._ack(sock, nonce)
+
+
+def probe_attach_fail() -> bool:
+    """只回"发送方有没有收到回执"：True＝投递失败也报了成功。"""
+    h = M.Handoff()
+    srv = HandoffServer(h)
+    w = BrokenWin()
+    QTimer.singleShot(250, lambda: h.attach(w))
+    try:
+        return M.forward_to_running([VID], key=srv.key, ack_ms=900, pump=APP.processEvents)
+    finally:
+        srv.close()
 
 
 def probe_log() -> int:
@@ -904,6 +974,9 @@ def build_mutations() -> list[tuple]:
     ("窗口没装配完就把路径丢掉（旧写法）", M.Handoff, "receive", old_receive,
      probe_receive_no_window,
      ["窗口没装配完时排队，attach 后一条不少，回执等真落地"]),
+    ("attach 投递失败也回执（旧写法）", M.Handoff, "attach", old_attach_acks_anyway,
+     probe_attach_fail,
+     ["attach 补交时窗口接不住 → 不回执、这批留在队列（B4）"]),
     ("nonce 不去重（同一批播两遍）", M.Handoff, "receive", no_dedup_receive,
      probe_nonce_twice, ["同一 nonce 重投只生效一次"]),
     ("留痕换成空函数", M, "log_launch", lambda *a, **k: "",

@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import tempfile
 import time
 from typing import Any
 
@@ -295,6 +296,18 @@ class _JobSignals(QObject):
     done = pyqtSignal(int, bool, str, str)   # job id, 成功?, 详情, 产物路径
 
 
+def temp_sub_path(out_dir: str, ext: str) -> str:
+    """给这一趟的字幕起一个**独占**的临时名（不占用户已有的 `clip.srt`）。
+
+    2026-11-12 审查 B3：旧写法写死 `clip + 原扩展名` 放在输出目录，`w` 覆盖同名用户文件、
+    收尾再删——用户放在导出目录的字幕跑一次导出就没了。`mkstemp` 先原子占位（并发两趟也
+    撞不上），`finally` 只删这一个我们建的文件。
+    """
+    fd, path = tempfile.mkstemp(prefix=".luhui_sub_", suffix=ext or ".srt", dir=out_dir)
+    os.close(fd)
+    return path
+
+
 class GifJob(QRunnable):
     """一趟导出。参数打包成一个 dict，命令在 run() 里现拼：
 
@@ -310,9 +323,10 @@ class GifJob(QRunnable):
         self.p = params
         self.sig = _JobSignals()
         self.out = params["out"]
+        # 字幕的临时文件要等 run() 里真读到字幕、真平移成功才建，名字也到那时才定
+        # （见 temp_sub_path 与 B3）。这里先拼不带字幕的命令，run 里再按需重拼。
         self.cmd = build_cmd(params["exe"], params["video"], params["start"],
-                             params["dur"], params["width"], params["fps"], self.out,
-                             params.get("sub_name") or "")
+                             params["dur"], params["width"], params["fps"], self.out, "")
         self.expect = expect_frames(params["dur"], params["fps"])
         self.cancelled = False
         self.proc = None
@@ -339,24 +353,29 @@ class GifJob(QRunnable):
             if self.cancelled:
                 self._finish(False, "已取消", keep=False)
                 return
-            sub_src, sub_name = self.p.get("sub_src") or "", self.p.get("sub_name") or ""
-            if sub_src and sub_name:
-                tmp_sub = os.path.join(os.path.dirname(self.out), sub_name)
+            sub_src = self.p.get("sub_src") or ""
+            if sub_src:
+                ext = os.path.splitext(sub_src)[1] or ".srt"
+                tmp_sub = temp_sub_path(os.path.dirname(self.out), ext)
                 with open(sub_src, encoding="utf-8", errors="replace") as fh:
                     text = fh.read()
                 shifted = shift_sub_text(text, os.path.splitext(sub_src)[1],
                                          float(self.p.get("delta") or 0.0))
                 if not shifted:
                     # 平移不出来就不烧一份错位的：退回无字幕的命令，界面详情里会写明。
-                    # 临时字幕文件这时**还没写过**，所以只需把名字清空，不能去删它。
-                    self.cmd = build_cmd(self.p["exe"], self.p["video"], self.p["start"],
-                                         self.p["dur"], self.p["width"], self.p["fps"],
-                                         self.out, "")
+                    # 占位的临时文件立刻删掉，别在用户目录里留个空文件。
+                    try:
+                        os.remove(tmp_sub)
+                    except OSError:
+                        pass
                     tmp_sub = ""
                     self.p["no_sub"] = "字幕时间轴平移失败，已改为不烧字幕"
                 else:
                     with open(tmp_sub, "w", encoding="utf-8", newline="\n") as fh:
                         fh.write(shifted)
+                    self.cmd = build_cmd(self.p["exe"], self.p["video"], self.p["start"],
+                                         self.p["dur"], self.p["width"], self.p["fps"],
+                                         self.out, os.path.basename(tmp_sub))
             with open(log, "wb") as lfh:
                 # poolkit.spawn 而非裸 Popen：这个孩子进登记册，退出收口时杀得到它。
                 # 实测过（tests/test_gif_real.py --residue）关掉窗口之后 pid 还在、
@@ -480,8 +499,6 @@ class GifStore(QObject):
         params = {"exe": self.exe, "video": video, "start": start, "dur": dur,
                   "width": int(width), "fps": int(fps), "out": out,
                   "sub_src": sub_file if sub_file and os.path.exists(sub_file) else "",
-                  "sub_name": ("clip" + (os.path.splitext(sub_file)[1] or ".srt"))
-                              if sub_file else "",
                   "delta": float(start) if (sub_file and sub_delta) else 0.0}
         job = GifJob(self._next_id, params)
         self._next_id += 1

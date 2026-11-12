@@ -290,6 +290,44 @@ def g_real_export_sub(tmp: str) -> tuple[bool, str]:
          f"不平移出字 {len(without)} 帧（必须 0，否则这条判据是摆设）")
 
 
+def g_user_sub_preserved(tmp: str) -> tuple[bool, str]:
+    """导出目录里用户自己的 `clip.srt` 不许被覆盖，更不许导出完顺手删掉。
+
+    2026-11-12 审查 B3 的现场：临时字幕写死成 `clip + 原扩展名` 放在**输出目录**里，
+    `w` 覆盖同名文件、收尾再 `os.remove`。用户在同一目录放了同名字幕，跑一次导出就没了。
+    判据只看用户那份的字节有没有变、目录里有没有本次临时文件的残留——临时名怎么起不管。
+    """
+    if not os.path.exists(FF):
+        return False, f"没找到 ffmpeg：{FF}"
+    video = ramp(tmp)
+    if not video:
+        return False, "样片生成失败"
+    out_dir = os.path.join(tmp, "shots8")
+    os.makedirs(out_dir, exist_ok=True)
+    user_sub = os.path.join(out_dir, "clip.srt")
+    marker = b"USER-OWN-CONTENT-MARKER-4c1d\n"
+    with open(user_sub, "wb") as fh:
+        fh.write(marker)
+    srt = os.path.join(tmp, "cue8.srt")
+    with open(srt, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(PGS.SRT)
+    store = G.GifStore(FF)
+    done: list[tuple[bool, str, str]] = []
+    store.sig_done.connect(lambda _i, ok, d, p: done.append((ok, d, p)))
+    jid, err = store.start(video, PGS.START, PGS.DUR, out_dir, width=320, fps=10,
+                           sub_file=srt)
+    if err:
+        return False, f"开不成：{err}"
+    if not pump(180, lambda: bool(done)):
+        return False, f"180 秒没回话（job {jid}）"
+    ok, detail, _path = done[0]
+    same = os.path.isfile(user_sub) and open(user_sub, "rb").read() == marker
+    left = sorted(os.listdir(out_dir))
+    junk = [f for f in left if f.startswith(".luhui_sub_")]
+    return (ok and same and not junk), \
+        f"{detail}；用户 clip.srt 保持原样={same} 临时残留={junk} 目录={left}"
+
+
 def g_store_rejects(tmp: str) -> tuple[bool, str]:
     """四条"开不成"必须各报各的，不能混成一句"导出失败"。"""
     d = os.path.join(tmp, "shots4")
@@ -413,6 +451,7 @@ CHECKS = [
     ("进度只认 out_time_us（out_time_ms、frame=、out_time= 都不认，不猜）", g_progress),
     ("真跑一趟：帧数=时长×帧率、宽=请求宽、循环 0 次、目录里不留临时文件", g_real_export),
     ("真跑带字幕一趟：平移后的在 cue 的原片时刻出字，不平移的一个字都不出", g_real_export_sub),
+    ("导出目录里用户自己的 clip.srt 一个字节都不许动，临时字幕不许留残留", g_user_sub_preserved),
     ("开不成的四种原因各报各的（没装 ffmpeg／视频不在／区间无效）", g_store_rejects),
     ("上一趟没跑完时第二趟被拒（并发两个 ffmpeg 会把解码线程占满）", g_busy_gate),
     ("取消：报「已取消」，不返回路径，也不留半截 GIF", g_cancel),
@@ -425,7 +464,7 @@ CHECKS = [
 # 这几条要真起 ffmpeg。没装时它们既不算 PASS 也不算 FAIL —— 报 ENV 并整轮 rc=3，
 # 因为"功能坏了"和"这台机器没这个二进制"是两种完全不同的处置。
 REAL = (g_real_export, g_real_export_sub, g_store_rejects, g_busy_gate, g_cancel,
-        g_bad_output_not_kept)
+        g_bad_output_not_kept, g_user_sub_preserved)
 
 
 def run(tmp: str) -> int:
@@ -463,7 +502,21 @@ def falsify(tmp: str) -> int:
     saved = {k: getattr(G, k) for k in ("clamp_range", "expect_frames", "shift_srt", "shift_ass",
                                         "shift_sub_text", "sub_file_of", "out_path", "build_cmd",
                                         "parse_progress", "read_gif", "GifStore", "GifJob",
+                                        "temp_sub_path",
                                         "MIN_DURATION", "MAX_DURATION", "_ASS_DLG")}
+    # 坏桩里有一类改的是**类对象上的方法**（`G.GifStore.start = naive`）。这种改法
+    # `setattr(G, "GifStore", saved["GifStore"])` 还原不了——saved 里存的就是同一个类，
+    # 属性早被改在它身上了。实发（2026-11-13）：D14 的 start 残到 D15 成了自递归，
+    # D18 的 start 残到 D22 让那趟导出不接 done 信号——D22 等满 180 秒"超时"蒙了个红，
+    # 并不是它那条断言把人赃俱获。所以类方法也要进账，逐轮装回原对象。
+    # 包一层的坏桩必须拿着**原件函数对象**去转调。上一版写 `saved["GifStore"].start(...)`，
+    # 而 `saved["GifStore"]` 就是同一个类、属性刚被桩改成它自己——自递归到栈溢出，
+    # "跑挂了"被计成 CAUGHT。D14 要的现场是"真跑一趟不平移、出字为 0"，不是 RecursionError。
+    orig_store_start = G.GifStore.start
+    saved_methods = [(cls, k, getattr(getattr(G, cls), k))
+                     for cls, ks in (("GifStore", ("start", "busy")), ("GifJob", ("_finish",)))
+                     for k in ks]
+    assert callable(orig_store_start)
     hits: list[tuple[str, bool, str]] = []
     covered: set = set()
     saved_sources = _py_sources
@@ -488,6 +541,8 @@ def falsify(tmp: str) -> int:
     def restore():
         for k, v in saved.items():
             setattr(G, k, v)
+        for cls, k, v in saved_methods:               # 类对象上的方法也要装回去
+            setattr(getattr(G, cls), k, v)
         globals()["_py_sources"] = saved_sources      # 坏桩会换掉扫描范围，逐轮还原
 
     # D1 clamp_range 只夹下限不夹上限
@@ -547,10 +602,18 @@ def falsify(tmp: str) -> int:
         G.sub_file_of = naive
     add("D7 文件没了照样回路径 → 存在性检查那半边必须红", g_sub_file_of, d7)
 
-    # D8 产物名不带序号（直接覆盖用户的东西）
+    # D8 产物名不带序号（直接覆盖用户的东西）。清洗规则照真实实现抄一份、只拿掉防撞
+    # 循环：上一版桩连清洗也拿掉了，产物名里带 `*?`，判据去 open 就直接
+    # FileNotFoundError——"崩了"被计成 CAUGHT，等于没证明这条判据会判。
     def d8():
-        G.out_path = lambda d, v, s, du, w, f: os.path.join(
-            d, f"{os.path.splitext(os.path.basename(v))[0]}_{s}s.gif")
+        import re as _re
+
+        def naive(d, v, s, du, w, f):
+            stem = os.path.splitext(os.path.basename(v))[0] or "clip"
+            stem = _re.sub(r'[\\/:*?"<>|\s]+', "_", stem)[:48]
+            os.makedirs(d, exist_ok=True)
+            return os.path.join(d, f"{stem}_{s:g}s_{du:g}s_{w}w{f}f.gif")
+        G.out_path = naive
     add("D8 固定文件名会覆盖 → 撞名自动 #1 那条必须被否", g_out_path, d8)
 
     # D9 -ss 放到 -i 之后（精确但慢到不可用）
@@ -605,8 +668,8 @@ def falsify(tmp: str) -> int:
     def d14():
         def naive(self, video, start, dur, out_dir, width=G.DEFAULT_WIDTH, fps=G.DEFAULT_FPS,
                   sub_file="", sub_delta=True):
-            return saved["GifStore"].start(self, video, start, dur, out_dir, width, fps,
-                                           sub_file, False)
+            return orig_store_start(self, video, start, dur, out_dir, width, fps,
+                                    sub_file, False)
         G.GifStore.start = naive
     add("D14 烧字幕不平移 → 出字那条必须被否（探针同一条结论）", g_real_export_sub, d14)
 
@@ -672,6 +735,12 @@ def falsify(tmp: str) -> int:
         _py_sources_probe = lambda: [bad]          # noqa: E731 - 只是换掉扫描范围
         globals()["_py_sources"] = _py_sources_probe
     add("D21 已知含 waitForFinished 的样本 → Qt6 名字那条必须点名它", g_no_qt6_names, d21)
+
+    # D22 临时字幕写死成输出目录里的 clip+扩展名（审查 B3 的旧写法：覆盖并删除用户文件）
+    def d22():
+        G.temp_sub_path = lambda d, ext: os.path.join(d, "clip" + (ext or ".srt"))
+    add("D22 临时字幕写死 clip+扩展名 → 用户同名字幕被覆盖/删除那条必须翻红",
+        g_user_sub_preserved, d22)
 
     bad = 0
     for label, hit, detail in hits:
