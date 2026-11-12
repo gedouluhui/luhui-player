@@ -2,10 +2,25 @@
 
 **Windows 本地视频播放器 —— mpv 解码内核 + PyQt5 自绘 Fluent 外壳。**
 
-无边框深色界面、DWM 原生圆角与阴影、硬解 / HDR / 全格式、外挂字幕、逐帧步进、A-B 循环、
+<p>
+<img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey">
+<img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
+<img alt="core" src="https://img.shields.io/badge/decoder-mpv-informational">
+</p>
+
+*A local video player for Windows: mpv does the decoding, a hand-drawn PyQt5 shell does the UI. No network, no DRM, no telemetry.*
+
+无边框深色界面、DWM 原生圆角与阴影、硬解 / HDR / 常见容器与编码、外挂字幕、逐帧步进、A-B 循环、
 真实画面缩略图、媒体库、断点续播。只播放本地文件：不联网、不抓取片源、不碰 DRM。
 
 ![LuHui播放器 首屏](docs/images/home.png)
+
+## 目录
+
+[一、怎么启动](#一怎么启动) · [二、出问题了先跑这一条](#二出问题了先跑这一条) · [三、能做什么](#三能做什么) ·
+[四、文件放在哪](#四文件放在哪) · [五、开发者：验收怎么跑](#五开发者验收怎么跑) · [六、明确不做](#六明确不做) · [七、许可](#七许可)
+
+只想先用起来：下载/打包 → 看「一、怎么启动」；出问题 → 直接跳「二」那一条自检。
 
 ## 亮点
 
@@ -522,3 +537,8 @@ GPU 实测 PASS 21／FAIL 0／ENV 0（三档装配串行，反向对照那趟真
 
 本项目以 **GNU GPL v3.0** 发布，全文见 `LICENSE`。之所以是 GPLv3：界面层使用 GPL 版本的 PyQt5。
 mpv、FFmpeg、Qt、Noto 字体的许可见 `THIRD_PARTY_NOTICES.md`。
+
+## 八、反馈
+
+提 [Issue](../../issues) 时请附：Windows 版本、播放器版本（或 commit）、片子的容器/编码
+（`mpv.log` 里能看到）、复现步骤。能附 `data\logs\crash.log` 最好——"突然没了"这类问题没有它就查不动。
