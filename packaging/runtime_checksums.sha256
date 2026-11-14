@@ -1,0 +1,6 @@
+# LuHui播放器 随包运行时固定清单（mpv v0.41.0-1101 / FFmpeg N-127213，官方 CI 构建）
+# 换内核时：重新生成这份清单 + 同步 README/README.en 的版本行；打包会先核对。
+# 格式：<sha256>  <相对仓库根的路径>（sha256sum 输出）
+28a0e801b2651c23cc8b385c2003ea4a60bd7e84d6fd2f061461d5fdbf3da89e  runtime/mpv/mpv.exe
+f141c1b89b172d22f213531646c21e288f0ebf3ec46484698896e1b33c626756  runtime/mpv/mpv/fonts.conf
+2e6592490e20bab667f7e272bab607585c4a22aa42627344675172a2c337db5c  runtime/ffmpeg/ffmpeg.exe

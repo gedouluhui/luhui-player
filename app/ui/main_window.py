@@ -472,7 +472,7 @@ class MainWindow(QWidget):
         self._open_timer.setSingleShot(True)
         self._open_timer.timeout.connect(lambda: self._settle_open_receipt(timed_out=True))
         # 和视频一起拖进来的字幕：`sub-add` 要等 file-loaded 之后才认，先记在这里
-        self._pending_subs: list[str] = []
+        self._pending_subs: tuple[str, list[str]] | None = None   # (目标片头路径, 字幕表)
         # 内核握手的轮询（见 _begin_engine/_poll_engine_start）：40ms 一拍，直到 ok/失败。
         # 排队里的每一项是 (files, subs, replace)——原样保留"这一趟是替换还是追加"，
         # 否则内核启动期间连拖两批会把第一批的语义悄悄改掉。
@@ -482,6 +482,7 @@ class MainWindow(QWidget):
         self._pending_open: list[tuple[list[str], list[str], bool]] = []
 
         self.chrome = Chrome(self)
+        self.chrome.on_dpi_changed = self._on_dpi_changed
         self._restore_geometry()
         self._install_shortcuts()
 
@@ -695,10 +696,12 @@ class MainWindow(QWidget):
         res = self.player.open_files(files, append=not replace, remember=True) or {}
         # 这一趟会换当前条目（plays=True）才等 file-loaded 再挂字幕；往正在播的队尾
         # 追加时根本不会来 file-loaded（见 open_files 的说明），字幕就挂当前这一支。
+        # 等回执的这一档必须带上**目标片的头路径**：快速 A→B 连切时，A 的 file-loaded
+        # 可能晚到，只认"当前路径对得上哪一批"，否则 A 的字幕会被挂到 B 上。
         if int(res.get("count", 0)) > 0 and subs and bool(res.get("plays")):
-            self._pending_subs = list(subs)
+            self._pending_subs = (str(res.get("head", "")), list(subs))
         else:
-            self._pending_subs = []
+            self._pending_subs = None
             if int(res.get("count", 0)) > 0 and subs:
                 self._attach_subtitles(subs)
         # 这句"已载入/已追加"不再当场印：以前它紧跟在 open_files() 后面无条件印出去，而
@@ -1179,6 +1182,19 @@ class MainWindow(QWidget):
             self._hide_timer.stop()
         self.video.refit()
         self._apply_topmost()
+
+    def _on_dpi_changed(self) -> None:
+        """跨屏 100%↔175%：重铺 mpv 的原生子窗口。
+
+        Qt 会按 WM_DPICHANGED 的建议矩形改自己的逻辑几何，但 `--wid` 嵌进来的子
+        窗口是 mpv 建的原生窗，不会跟着 Qt 缩放；强制铺一遍（force 绕过"几何键没变"
+        的跳过），按新的物理客户区把宽高校准回来。异常必须吞掉：这是在原生消息的
+        定时回调里跑，抛出去会 abort 整个进程。
+        """
+        try:
+            self.video.refit(force=True)
+        except Exception:
+            pass
 
     def _side_for_fs(self, fs: bool) -> None:
         """全屏把侧栏收起、退出全屏再还给用户。
@@ -2044,9 +2060,14 @@ class MainWindow(QWidget):
         self.lib_panel.note_played(str(self.player.prop("path", "") or ""))
         # 和这支片一起拖进来的字幕：现在内核才认得 sub-add。放在最后——上面那条
         # `path` 刚被内核推回来，_attach_subtitles 的守卫读的就是它。
+        # 路径必须对得上：不等回执的那一批已经挂在"发起时"的片上，而这一批是给
+        # 某支**特定**文件的；晚到的旧 file-loaded 不许把它的字幕错挂到当前这支队上。
         if self._pending_subs:
-            subs, self._pending_subs = self._pending_subs, []
-            self._attach_subtitles(subs)
+            head, subs = self._pending_subs
+            loaded = str(self.player.prop("path", "") or "")
+            if not head or cfgmod.same_media_path(head, loaded):
+                self._pending_subs = None
+                self._attach_subtitles(subs)
 
     def _on_duration(self, dur: float) -> None:
         """时长落定＝这一格该抽多少秒一张才算得出来，于是排队抽帧。

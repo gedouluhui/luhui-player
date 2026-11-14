@@ -83,8 +83,11 @@ def main() -> int:
         check("launch.log 记到 cold 启动", "cold" in text,
               (text.strip().splitlines() or ["(空)"])[-1][:120])
         crash = os.path.join(data, "logs", "crash.log")
-        check("没有 crash.log", not os.path.isfile(crash),
-              open(crash, encoding="utf-8", errors="replace").read()[:200] if os.path.isfile(crash) else "")
+        crash_body = (open(crash, encoding="utf-8", errors="replace").read()[:200]
+                      if os.path.isfile(crash) else "")
+        # 0 字节的 crash.log 是 faulthandler 常开句柄建的，不是一次崩溃。
+        check("没有崩溃记录（空 crash.log 只是常开句柄）",
+              not crash_body.strip(), crash_body)
         check("数据目录落在 GELU_DATA 上",
               os.path.isdir(os.path.join(data, "logs")),
               data)

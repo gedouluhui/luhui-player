@@ -1,0 +1,41 @@
+name: CI
+
+# 发布门禁（审计 P2 + 供应链）：
+#   ① compileall 编译检查；② 防泄漏扫描（个人绝对路径一处都不许进仓库）；
+#   ③ 离线回归全套（真内核/真屏探针在本地跑，不在 CI 里假装跑过）。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyQt5
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "PyQt5==5.15.10"
+
+      - name: Compile all (app / packaging / tests)
+        run: python -m compileall -q app packaging tests
+
+      - name: Leak scan (no personal absolute paths)
+        run: python tests/ci_leak_scan.py
+
+      - name: Offline regression suite
+        run: python tests/ci_offline.py --timeout 300

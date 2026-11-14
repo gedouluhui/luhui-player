@@ -25,6 +25,7 @@ from typing import Any, Iterable
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from .. import config as cfgmod
+from .. import win32
 from . import perf, tweaks, transform
 from . import equalizer
 from .ipc import IpcError, MpvIpc
@@ -180,6 +181,11 @@ class MpvPlayer(QObject):
         self._ipc: MpvIpc | None = None
         self._proc: subprocess.Popen | None = None
         self._props: dict[str, Any] = {}       # 订阅来的最新属性值（读它不阻塞）
+        # `_props` 的写者是 IPC 读线程（_apply），读者是 UI 主线程（prop/open_files/set_tweak…）。
+        # dict 的单条 get/set 自身原子，但"清一批键""读一份快照"这类复合操作不是——
+        # 换片瞬间的 _FILE_SCOPED 清空与 file-loaded 的快照曾经可以交错。RLock 而不是 Lock：
+        # `_apply` 持锁期间可能被同一个线程的属性回调重入（本机实测过 stats 持锁调 pools 的死锁）。
+        self._props_lock = threading.RLock()
         # 内核 `vf` 列表里当前的滤镜名。**缓存这个而不是每次现问**：统计页与面板 redraw
         # 都要读它，同步往返会把 UI 线程拖住；且它从来不能单独当"滤镜在跑"的证据
         # （硬解帧下滤镜会被内核扔掉、列表照样好看），所以真判据在内核日志那几行，
@@ -405,6 +411,9 @@ class MpvPlayer(QObject):
                 self.sig_log.emit(f"启动 mpv 失败：{type(exc).__name__}: {exc}")
                 return False
             self._proc_started = time.monotonic()
+            # 与 poolkit.spawn 同一条理由：正常退出有 close() 杀它，主进程被强杀/崩溃时
+            # 只有 Job 的 kill-on-close 能把 mpv 带走（否则窗口没了声音还在）。
+            win32.assign_to_kill_job(self._proc.pid)
             self._ipc = MpvIpc(self.pipe_path)
             self._starting = True
             self._start_timeout = max(0.5, float(wait))
@@ -451,7 +460,8 @@ class MpvPlayer(QObject):
         """管道已连上之后的收尾：与旧 start() 里那一段逐行同源。"""
         assert self._ipc is not None
         self._wire_events()
-        self._props.clear()
+        with self._props_lock:
+            self._props.clear()
         # 滤镜名缓存跟着内核一起归零：换进程就是换内核，链上什么都没有。
         # 注意这里**不**清 `_FILE_SCOPED` 那条路径——实测链子跨 loadfile 留着，
         # 换片时清掉会让面板显示"没开滤镜"，而内核其实还在跑上一条。
@@ -617,9 +627,10 @@ class MpvPlayer(QObject):
                     files = self.last_files[:]
                     pos = self.last_pos
                     if files:
-                        self.open_files(files, play_index=0)
-                        if pos > 1:
-                            self.seek_abs(pos)
+                        # 位置交给 loadfile 的 start=：在 file-loaded 之前发 seek 会被内核
+                        # 丢弃或报 property unavailable（旧写法就是这样丢续播的）。
+                        self.open_files(files, play_index=0,
+                                        start_pos=pos if pos > 1 else 0.0)
 
         self._watchdog = threading.Thread(target=loop, name="mpv-watchdog", daemon=True)
         self._watchdog.start()
@@ -646,7 +657,8 @@ class MpvPlayer(QObject):
 
     def prop(self, name: str, default: Any = None) -> Any:
         """读订阅缓存（不阻塞、不发请求，可在任何线程安全调用）。"""
-        v = self._props.get(name, default)
+        with self._props_lock:
+            v = self._props.get(name, default)
         return default if v is None else v
 
     # 没有媒体时内核把这些属性推成字符串 "no"（不是数字）。缓存里留着 "no"，
@@ -670,7 +682,10 @@ class MpvPlayer(QObject):
     def _apply(self, name: str, value: Any) -> None:
         if name in self._NUMERIC:
             value = self._num(value)
-        self._props[name] = value          # 先入缓存：UI 与事件处理都读这里
+        # 入缓存在锁内、发信号在锁外：信号是 queued 到 UI 线程的，UI 反过来可能读缓存；
+        # 若持着锁发信号，读线程等 UI、UI 等锁，一次换片就能把两边钉住。
+        with self._props_lock:
+            self._props[name] = value
         try:
             if name == "time-pos":
                 self.sig_time.emit(float(value or 0.0))
@@ -859,7 +874,7 @@ class MpvPlayer(QObject):
         return out
 
     def open_files(self, paths: list[str], append: bool = False, play_index: int | None = None,
-                   remember: bool = True) -> dict[str, Any]:
+                   remember: bool = True, start_pos: float | None = None) -> dict[str, Any]:
         """把这批文件交给内核，并**回一句"这一趟让内核干什么"**给界面。
 
         返回值不是装饰，是 2026-10-19 那笔事故的正面修法：界面那句"已载入 N 个文件"以前是
@@ -899,7 +914,13 @@ class MpvPlayer(QObject):
             first = i == 0 and not append_first
             cmd: list[Any] = ["loadfile", p, "replace" if first else "append"]
             if first:
-                pos = (self.cfg.recall_position(p) if self.cfg["resume"] else 0.0) or 0.0
+                # `start_pos` 是"这一趟必须从这个位置开始"（看门狗崩溃恢复传进来的），
+                # 优先于按路径回查的续播；由 loadfile 的 start= 交给内核，避免在
+                # file-loaded 之前盲目 seek（那条命令会被内核丢弃/报 property unavailable）。
+                if start_pos is not None:
+                    pos = max(0.0, float(start_pos))
+                else:
+                    pos = (self.cfg.recall_position(p) if self.cfg["resume"] else 0.0) or 0.0
                 self.last_pos = pos
                 if pos > 1:
                     # 续播位置带在命令里。**形状是真内核量出来的**，别照文档改回去：
@@ -954,8 +975,14 @@ class MpvPlayer(QObject):
     def seek_rel(self, secs: float) -> None:
         self._fire(["seek", secs, "relative"])
 
-    def seek_abs(self, secs: float) -> None:
-        self._fire(["seek", max(0.0, float(secs)), "absolute"])
+    def seek_abs(self, secs: float, exact: bool = False) -> None:
+        """绝对定位。`exact=True` 精确到帧（松手定帧/快捷键），否则按关键帧落点。
+
+        拖动途中用关键帧档：每次拖动都要求解码到精确位置会把 CPU 与 IPC 队列同时灌满；
+        松手那一下才值得一次精确 seek——用户盯着的那一帧必须就是他放下的位置。
+        """
+        mode = "absolute+exact" if exact else "absolute+keyframes"
+        self._fire(["seek", max(0.0, float(secs)), mode])
 
     def frame_step(self, backward: bool = False) -> None:
         self.set_prop("pause", True)
@@ -1242,7 +1269,8 @@ class MpvPlayer(QObject):
         actual = self.get(prop, None)
         ok = tweaks.same_value(item, py, actual)
         if ok:
-            self._props[prop] = actual       # 缓存换成内核的真值
+            with self._props_lock:
+                self._props[prop] = actual   # 缓存换成内核的真值
             # 自己把这一发广播出去。多数可调项内核也会推 property-change，但实测
             # 本机 v0.41.0-1101 对 **sub-border-size 不推**（改了值、get 得到新值、
             # 事件永远不来，播着片也一样）。订阅缓存是界面唯一的真值来源，少了这一发
@@ -1351,7 +1379,8 @@ class MpvPlayer(QObject):
             actual = self.get(prop, None)
             ok = transform.same_value(cfg_key, py, actual)
             if ok:
-                self._props[prop] = actual
+                with self._props_lock:
+                    self._props[prop] = actual
                 self.sig_info.emit({prop: actual})
             else:
                 self.sig_log.emit(f"{prop} 请求 {want!r} 但内核回报 {actual!r}")
@@ -1631,8 +1660,9 @@ class MpvPlayer(QObject):
 
     def _on_start_file(self, msg: dict) -> None:
         self._chapter_expect = None          # 换片子：上一支的连按期望不属于这一支
-        for k in self._FILE_SCOPED:
-            self._props.pop(k, None)
+        with self._props_lock:
+            for k in self._FILE_SCOPED:
+                self._props.pop(k, None)
 
     def _on_file_loaded(self) -> None:
         """运行在 IPC 读线程：只准读订阅缓存，绝不能发同步请求（ipc.request 已加守卫）。
@@ -1646,17 +1676,23 @@ class MpvPlayer(QObject):
         # 生成，我们插不进参数。于是换片完成后按路径再问一次观看进度，有就异步 seek。
         # `seek_abs` 走 `_fire`（写队列），在读线程里调用是安全的；`recall_position`
         # 只碰本地配置缓存/文件，不发 IPC。
-        path = str(self._props.get("path") or "")
+        with self._props_lock:
+            path = str(self._props.get("path") or "")
+            norm = os.path.normcase(os.path.normpath(path)) if path else ""
+            # 只认"这条路径确实是我们用 start= 带过来的"：别的文件先到的旧 file-loaded
+            # 不许把这条标记吃掉，否则真正的 file-loaded 会再 seek 一次、打断精确起播。
+            matched = bool(norm) and norm == self._resume_skip
+            if matched:
+                self._resume_skip = ""
+            info = {k: self._props.get(k) for k in self._FILE_SCOPED if k in self._props}
         if path:
-            norm = os.path.normcase(os.path.normpath(path))
-            if self._resume_skip and norm == self._resume_skip:
-                self._resume_skip = ""       # 这一条已经由 start= 带过去了
+            if matched:
+                pass                          # 这一条已经由 start= 带过去了
             elif self.cfg["resume"]:
                 pos = self.cfg.recall_position(path)
                 if pos > 1:
                     self.seek_abs(pos)
                     self.last_pos = pos
-        info = {k: self._props.get(k) for k in self._FILE_SCOPED if k in self._props}
         if info:
             self.sig_info.emit(info)
 

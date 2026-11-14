@@ -29,7 +29,8 @@
 ## 亮点
 
 - **内核是 mpv**：解码、硬解、色彩管理与渲染都交给 mpv，外壳只负责交互与视觉。
-- **自绘 Fluent 界面**：无边框窗口、原生贴边/阴影/圆角、六个侧栏页，125%–300% 缩放下按物理像素绘制。
+- **自绘 Fluent 界面**：无边框窗口、原生贴边/阴影/圆角、六个侧栏页，125%–300% 缩放下按物理像素绘制
+  （应用清单 PerMonitorV2 + 小数倍 PassThrough；跨屏拖动后按 `WM_DPICHANGED` 校准 mpv 原生子窗口）。
 - **影厅级时间轴**：悬停出真实帧缩略图 + 时间气泡，章节标记、缓冲范围、A-B 循环可视化。
 - **字幕与画面**：内嵌/外挂字幕、双语、延迟微调；12 项几何与画质调整（旋转、裁剪、镜像、锐化、降噪、去色带）。
 - **单实例**：再次双击文件会转交给已开实例，不叠窗口。
@@ -378,6 +379,28 @@ runtime\ffmpeg\ffmpeg.exe      ← 可选，只影响 GIF 导出与时间轴缩�
 源码仓库不提交这些运行时文件（`.gitignore` 把整个 `runtime\` 排除在外），自行准备放入即可：
 mpv 见 https://mpv.io/installation/ ，FFmpeg 见 https://ffmpeg.org/download.html 。
 `fonts.conf` 用 Fontconfig for Windows 自带的那份标准模板，原样放进 `runtime\mpv\mpv\`。
+
+**外部二进制零盲信**：`packaging\runtime_checksums.sha256` 固定了上面三份文件的 SHA-256
+（当前对应 mpv v0.41.0-1101 / FFmpeg N-127213）。`portable.spec` 开打前先核对，
+对不上就停下；换内核必须同步更新清单与这里/README.en 的版本行。单独核对：
+
+```bat
+python packaging\verify_runtime.py
+```
+
+---
+
+### 自动化门禁
+
+`.github/workflows/ci.yml` 在 `windows-latest` 上跑三件事：
+
+1. `python -m compileall -q app packaging tests`——全树编译检查；
+2. `python tests\ci_leak_scan.py`——发布前防泄漏，个人绝对路径一处都不许进仓库；
+3. `python tests\ci_offline.py`——离线回归全套（23 份脚本、415 条判据，强制 offscreen、每份独立数据目录与限时）。
+
+需要真实 mpv、真 ffmpeg、本地改前留底或生成产物的脚本（`test_engine.py`、`test_ui.py`、`test_thumbs.py`、
+`test_library.py`、`test_instance.py` 等）**不在 CI 里假装跑过**，留在本地按需执行；`pytest.ini` 用
+`unit` / `probe` 标记区分两类。均衡器在 CI 里自动带 `--no-kernel`，只跑不依赖内核的那一半。
 
 ---
 

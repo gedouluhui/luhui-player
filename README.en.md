@@ -20,7 +20,8 @@ No Electron, no web view, no network, no DRM, no telemetry.
 - **The engine is mpv.** Decoding, hardware acceleration, colour management and rendering are mpv's job;
   the shell only handles interaction and visuals. No reimplementation of codecs, no broken HDR.
 - **The UI is drawn, not skinned.** Frameless window, native DWM rounded corners and shadow, six sidebar
-  pages, painted at physical pixels from 125% to 300% scaling.
+  pages, painted at physical pixels from 125% to 300% scaling (PerMonitorV2 manifest + fractional
+  PassThrough; the embedded mpv child window is re-fitted on `WM_DPICHANGED`).
 - **A timeline that shows the film.** Hovering shows real frame thumbnails with a time bubble; chapter
   markers, buffered range and A-B loop are visible.
 - **Portable by construction.** onedir packaging: copy the folder, it runs. Config, cache, screenshots live
@@ -66,6 +67,19 @@ python -m PyInstaller packaging/portable.spec --noconfirm
 
 `portable.spec` checks `runtime\` contents before packing and stops with `缺少打包资源：<path>` if something
 is missing. Output: `dist\LuHui播放器\`.
+
+External binaries are never trusted blindly: `packaging/runtime_checksums.sha256` pins the SHA-256 of
+`mpv.exe`, `fonts.conf` and `ffmpeg.exe` (currently mpv v0.41.0-1101 / FFmpeg N-127213). The spec verifies
+them before building and refuses on a mismatch; `python packaging/verify_runtime.py` runs the same check
+standalone. When swapping the engine, update the manifest and the version line in both READMEs.
+
+## CI gates
+
+`.github/workflows/ci.yml` runs on `windows-latest`: `compileall` over the whole tree, a leak scan that
+forbids personal absolute paths (`tests/ci_leak_scan.py`), and the full offline suite
+(`tests/ci_offline.py` — 23 scripts / 415 checks, offscreen, isolated data dir, per-test timeout).
+Scripts that need a real mpv/ffmpeg, local before-change baselines or generated launchers stay local as
+probes; `pytest.ini` separates `unit` from `probe`. The equalizer runs its no-kernel half in CI.
 
 ## Something is wrong? Run the doctor first
 

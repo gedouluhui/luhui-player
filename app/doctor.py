@@ -633,6 +633,9 @@ def j_instance(f: dict) -> tuple[str, str, str]:
 def j_crash(f: dict) -> tuple[str, str, str]:
     if not f.get("crash_exists"):
         return OK, "没有 crash.log（没记到未捕获异常）", "——"
+    if not int(f.get("crash_bytes") or 0):
+        # faulthandler 的句柄一启动就建文件（0 字节）。文件在≠崩过，别拿空文件吓人。
+        return OK, "crash.log 是空的（启动时开的常驻句柄，没记到未捕获异常）", "——"
     tail = " ‖ ".join((f.get("crash_tail") or [])[-2:]) or "(空)"
     try:
         crash_mt = float(f.get("crash_mtime") or 0)

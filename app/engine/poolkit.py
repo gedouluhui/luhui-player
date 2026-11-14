@@ -50,6 +50,8 @@ from typing import Any
 
 from PyQt5.QtCore import QCoreApplication, QObject, QThreadPool, pyqtSignal
 
+from .. import win32
+
 # 回报载荷各家形状不同（thumb/poster 是 str key，gif 是 int id + 4 个参数，scan 是 list+dict），
 # 所以名册只养"壳"，不假设它的签名；子类按需再挂别的信号。
 class JobSignals(QObject):
@@ -65,7 +67,10 @@ class JobSignals(QObject):
 # 调用线程永久冻住，D 组两趟各挂 120s）。登记表里的函数互相调用是常态，不许靠"别嵌套"维持。
 _LOCK = threading.RLock()
 _PINNED: dict[int, Any] = {}          # id(信号壳) -> 壳（在途作业强引用）
-_CHILDREN: dict[int, Any] = {}        # id(job) -> subprocess.Popen（我们生的孩子，退出时要杀）
+# 一个作业可以同时有多个在途孩子：媒体库的并发探测（ThreadPoolExecutor）会让同一个
+# ScanJob 名下同时挂着最多 4 个 ffmpeg。登记形状因此是"名单"而不是"单槽"——单槽
+# 会被后一个覆盖，退出收口只杀得到最后一个，其余变成孤儿继续跑完。
+_CHILDREN: dict[int, list[Any]] = {}  # id(job) -> [subprocess.Popen]（我们生的孩子，退出时要杀）
 _POOLS: dict[int, tuple[QThreadPool, str]] = {}     # id(pool) -> (池子, 名字)
 _SWALLOWED: list[str] = []            # 最近几条"吞掉的发射"原文（判据要能点名，不能只给计数）
 _COUNTS = {"swallowed": 0, "pinned": 0, "killed": 0, "shutdowns": 0, "stuck": 0}
@@ -151,14 +156,31 @@ def spawn(job: Any, cmd: list[str], **kw) -> subprocess.Popen:
     产物从 0 字节一路写到 5 MB——用户以为"取消了"，其实"关掉了个还在后台写盘的导出"。"""
     kw.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
     proc = subprocess.Popen(cmd, **kw)
+    # 内核级收口：主进程被强杀/崩溃时，我们自己的收尾代码一句都跑不到，
+    # 只有 Job 能替我们杀掉这些孩子。失败不致命（正常退出还有 _CHILDREN 兜着）。
+    win32.assign_to_kill_job(proc.pid)
     with _LOCK:
-        _CHILDREN[id(job)] = proc
+        _CHILDREN.setdefault(id(job), []).append(proc)
     return proc
 
 
 def drop_child(job: Any) -> None:
     with _LOCK:
         _CHILDREN.pop(id(job), None)
+
+
+def _forget_child(job: Any, proc: Any) -> None:
+    """只摘掉这一个孩子（并发探测时别的兄弟还在跑，不能整张名单一起扔）。"""
+    with _LOCK:
+        lst = _CHILDREN.get(id(job))
+        if lst is None:
+            return
+        try:
+            lst.remove(proc)
+        except ValueError:
+            pass
+        if not lst:
+            _CHILDREN.pop(id(job), None)
 
 
 def run(job: Any, cmd: list[str], timeout: float | None = None, **kw) -> subprocess.CompletedProcess:
@@ -187,13 +209,13 @@ def run(job: Any, cmd: list[str], timeout: float | None = None, **kw) -> subproc
                                            out if text else (out or b""),
                                            err if text else (err or b""))
     finally:
-        drop_child(job)
+        _forget_child(job, proc)
 
 
 def kill_children() -> int:
     """杀掉所有登记过、还活着的孩子。只动这张名册里的 pid——绝不按镜像名批处理。"""
     with _LOCK:
-        procs = list(_CHILDREN.values())
+        procs = [p for lst in _CHILDREN.values() for p in lst]
     n = 0
     for p in procs:
         try:
@@ -210,7 +232,7 @@ def kill_children() -> int:
 
 def child_pids() -> list[int]:
     with _LOCK:
-        return [int(p.pid) for p in _CHILDREN.values()]
+        return [int(p.pid) for lst in _CHILDREN.values() for p in lst]
 
 
 # ---------------- 池子 ----------------
@@ -310,7 +332,7 @@ def stats() -> dict[str, Any]:
     with _LOCK:
         out = dict(_COUNTS)
         out["pinned"] = len(_PINNED)
-        out["children"] = len(_CHILDREN)
+        out["children"] = sum(len(v) for v in _CHILDREN.values())
         out["swallowed_text"] = list(_SWALLOWED)
         out["pools"] = sorted(n for n, _p in pools())
         out["closing"] = _CLOSING

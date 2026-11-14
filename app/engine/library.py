@@ -20,6 +20,7 @@ import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterable
 
 from PyQt5.QtCore import QCoreApplication, QObject, QRunnable, pyqtSignal
@@ -34,6 +35,12 @@ VIDEO_EXT = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm", ".m4v", ".
 SKIP_DIR_PREFIX = ("$", ".", "@eaDir")
 MAX_DEPTH = 6
 MAX_FILES = 3000
+# 超过这个数先发骨架列表：卡片（和 "--:--"）先全部出现，时长随后补。小于它时
+# 一趟探测本来就是一秒内的事，多发一帧只会让列表闪一下。
+PREVIEW_MIN = 80
+# 探测是"起 ffmpeg 读容器头"的 IO+进程活；4 路已经足够把 200 项压进几秒，
+# 再高就是拿风扇换零点几秒（池子里每个孩子都要登记、收口时要杀）。
+PROBE_WORKERS_MAX = 4
 
 _DUR_RE = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2})(?:\.(\d{1,3}))?", re.IGNORECASE)
 
@@ -140,6 +147,16 @@ def _is_under(path: str, root: str) -> bool:
     return p == r or p.startswith(r + os.sep)
 
 
+def _live(path: str, gone: set[str], roots: list[str]) -> bool:
+    """这一条还该不该出现在库/索引里：没被移除（墓碑）且仍在某个当前根下。
+
+    扫描在工作线程里拿着旧快照跑，回包与骨架帧都要过这一道——两处必须是同一条判据，
+    所以提取成函数，而不是在两个信号处理里各抄一份。
+    """
+    np = _norm_path(path)
+    return np not in gone and any(_is_under(np, r) for r in roots)
+
+
 class _ScanSignals(QObject):
     """扫描作业的回报壳。它不继承 `poolkit.JobSignals`：那边 `done` 的签名是
     (str, bool, str)，这里是 (list, dict, str)——同一个名字挂两个签名不同的信号，
@@ -147,16 +164,21 @@ class _ScanSignals(QObject):
     """
     done = pyqtSignal(list, dict, str)     # 条目表, 新索引, 摘要（给日志/验收）
     progress = pyqtSignal(int, str)        # 已处理数, 当前目录
+    preview = pyqtSignal(list)             # 骨架表：文件摊平完先发一帧，时长还没探
 
 
 class ScanJob(QRunnable):
-    """一趟扫描：摊平文件 → 对"变了/没见过"的探测时长 → 整表回报。"""
+    """一趟扫描：摊平文件 → 先发骨架 → 并发探测"变了/没见过"的时长 → 整表回报。"""
 
     def __init__(self, exe: str, roots: list[str], index: dict[str, dict],
                  max_files: int = MAX_FILES):
         super().__init__()
         self.autoDelete = True
-        self.exe, self.roots, self.index = exe, list(roots), dict(index)
+        self.exe, self.roots = exe, list(roots)
+        # 索引键在入口就统一成规范形：盘上的旧索引可能是任何写法（大写盘符、
+        # 正斜杠、尾分隔符），不先归一的话 `get()` 永远打不中，增量缓存整库失效。
+        self.index = {_norm_path(k): v for k, v in dict(index).items()
+                      if k and isinstance(v, dict)}
         self.max_files = max_files
         self.sig = _ScanSignals()
         self.running = False
@@ -170,31 +192,63 @@ class ScanJob(QRunnable):
         cut = ""
         try:
             paths = walk(self.roots, self.max_files)
-            out: list[dict] = []
-            new_index: dict[str, dict] = {}
-            for i, p in enumerate(paths):
-                if poolkit.is_closing():
-                    # 扫描是"几百个 ffprobe 串成一串"的活，退出收口时不能让它把整串跑完。
-                    # 这里按**已经处理过的那一段**出账：new_index 里已有的条目照原样回报，
-                    # 剩下的下一趟再补（索引是按 size/mtime 增量的，跳过不是丢数据）。
-                    cut = f"（退出收口，扫到 {i}/{len(paths)} 就停了）"
-                    break
-                if i % 20 == 0:
-                    poolkit.emit(sig, "progress", i, os.path.dirname(p))
-                e = entry_for(p)
-                old = self.index.get(e["path"])
+            out: list[dict] = [entry_for(p) for p in paths]
+            todo: list[dict] = []
+            ready: set[str] = set()          # 已定时长（复用命中）的规范键
+            for e in out:
+                key = _norm_path(e["path"])
+                old = self.index.get(key)
                 # 只有"大小和修改时间都没变"才算没变过。mtime 会因复制/下载而变，
                 # 那种情况重探一次是诚实的代价，宁可慢也不要拿旧时长贴新片。
                 if old and abs(float(old.get("size") or 0) - e["size"]) < 1 \
                         and abs(float(old.get("mtime") or 0) - e["mtime"]) < 1.0:
                     e["dur"] = float(old.get("dur") or 0.0)
+                    ready.add(key)
                     reused += 1
                 else:
-                    e["dur"] = (probe_duration(self.exe, p, owner=self)
-                                if os.path.exists(self.exe) else 0.0)
-                    probed += 1
-                new_index[e["path"]] = {"size": e["size"], "mtime": e["mtime"], "dur": e["dur"]}
-                out.append(e)
+                    todo.append(e)
+            if len(out) >= PREVIEW_MIN:
+                # 骨架帧：先让整片库"出现"。发的是**浅拷贝**——这些 dict 随后会被
+                # 探测结果原地改写，直接发引用的话界面收到的骨架会跟着变成终值，
+                # 这一帧就白发了（验收脚本读到的也是"骨架已带时长"）。
+                poolkit.emit(sig, "preview", [dict(e) for e in out])
+            done_keys: set[str] = set()
+            if todo and poolkit.is_closing():
+                # 扫描是"几百个 ffmpeg 起进程"的活，退出收口时不能让它整串跑完。
+                # 按**已经处理过的那一段**出账：new_index 只收已定时长的条目，
+                # 剩下的下一趟再补（索引按 size/mtime 增量，跳过不是丢数据）。
+                cut = f"（退出收口，探到 0/{len(todo)} 就停了）"
+            elif todo:
+                workers = min(PROBE_WORKERS_MAX, os.cpu_count() or 2)
+                pool = ThreadPoolExecutor(max_workers=workers)
+                try:
+                    futs = {pool.submit(probe_duration, self.exe, e["path"], 20.0, self): e
+                            for e in todo}
+                    finished = 0
+                    for fut in as_completed(futs):
+                        e = futs[fut]
+                        try:
+                            e["dur"] = float(fut.result() or 0.0)
+                        except Exception:    # 单个探测炸了只降级这一条
+                            e["dur"] = 0.0
+                        done_keys.add(_norm_path(e["path"]))
+                        probed += 1
+                        finished += 1
+                        if finished % 20 == 0:
+                            poolkit.emit(sig, "progress", reused + finished,
+                                         os.path.dirname(e["path"]))
+                        if poolkit.is_closing():
+                            cut = f"（退出收口，探到 {finished}/{len(todo)} 就停了）"
+                            break
+                finally:
+                    # 不等在途探测：它们的孩子登记在 poolkit，退出收口会统一杀掉；
+                    # 排队的直接取消（Python 3.9+ 的 cancel_futures）。
+                    pool.shutdown(wait=False, cancel_futures=True)
+            new_index: dict[str, dict] = {}
+            for e in out:
+                key = _norm_path(e["path"])
+                if key in ready or key in done_keys:
+                    new_index[key] = {"size": e["size"], "mtime": e["mtime"], "dur": e["dur"]}
             poolkit.emit(sig, "done", out, new_index,
                          f"{len(out)} 个媒体文件（探测 {probed} / 复用 {reused}）"
                          f"，用时 {time.time() - t0:.2f}s{cut}")
@@ -245,7 +299,10 @@ class Library(QObject):
             with open(self.index_path, encoding="utf-8") as fh:
                 d = json.load(fh)
             if isinstance(d, dict):
-                self._index = {k: v for k, v in d.items() if isinstance(v, dict)}
+                # 读的时候就归一：旧版本写下的键可能是大写盘符/正斜杠/带尾分隔符，
+                # 扫描侧的查找键是规范形，两边不统一等于索引整库失效。
+                self._index = {_norm_path(k): v for k, v in d.items()
+                               if k and isinstance(v, dict)}
         except (OSError, ValueError):
             self._index = {}
         return self._index
@@ -294,11 +351,23 @@ class Library(QObject):
         self._gone.clear()               # 新一趟开始：上一趟的墓碑已经随回包清过，防御性清空
         self._job = ScanJob(self.exe, self.roots, self._index)
         self._job.sig.done.connect(self._on_done)
+        self._job.sig.preview.connect(self._on_preview)
         self._job.sig.progress.connect(lambda n, d: self.sig_status.emit(f"扫描中… {n} 个"))
         self._busy = True
         self.sig_busy.emit(True)
         self._pool.start(self._job)
         return True
+
+    def _on_preview(self, items: list) -> None:
+        """骨架帧：整表先出现（时长还没探），不落盘、不动 `_busy`/`_items`。
+
+        过滤规则与 `_on_done` 完全一致（墓碑 + 当前根）：移除动作可能恰好发生在
+        骨架帧与终帧之间，那一份旧快照同样不许把删掉的条目带回来。
+        """
+        roots = list(self.roots)
+        gone = self._gone
+        self.sig_items.emit([e for e in list(items or [])
+                             if _live(str(e.get("path") or ""), gone, roots)])
 
     def _on_done(self, items: list, index: dict, detail: str) -> None:
         """扫描回包：先按"这一趟开始之后发生的移除"与"现在的根集合"过滤，再落盘。
@@ -313,8 +382,7 @@ class Library(QObject):
         gone = self._gone
 
         def keep(p: str) -> bool:
-            np = _norm_path(p)
-            return np not in gone and any(_is_under(np, r) for r in roots)
+            return _live(p, gone, roots)
 
         self._index = {k: v for k, v in dict(index or {}).items() if keep(k)}
         self._items = [e for e in list(items or [])

@@ -236,6 +236,9 @@ class LibraryPanel(QWidget):
         self.fill_batches = 0        # 补图分了几个空闲片跑完
         self.placeholders_made = 0   # 占位块画了几次（同扩展名×尺寸档只该画一次）
         self.poster_scans = 0        # _on_poster 为找到那一行摸过几张卡（命中就该停）
+        # 封面键 → 卡片行：封面按 key 回来，线性扫 grid 是 O(行数)；库里 3000 项成批
+        # 回图时这就是几百万次 item()。字典在重建时清空、补图时登记，命中即 O(1)。
+        self._key_items: dict[str, QListWidgetItem] = {}
         self.card_layouts = 0        # 真正改过几次卡片尺寸（同尺寸的 resize 不该抖）
         self.card_w = GRID_W         # 当前格宽/列数（判据与预览读它们）
         self.card_cols = 1
@@ -688,6 +691,7 @@ class LibraryPanel(QWidget):
 
         self.grid.blockSignals(True)
         self.grid.clear()
+        self._key_items.clear()                 # 旧表的行随 grid.clear() 作废，定位表同步清
         self.sync_decodes = 0                   # 只统计"重建这一趟里同步解码了几张"
         # 一次 stat 换整张进度表：逐卡调 cfg.watch_state 会为"外部有没有改过"各 stat 一次，
         # 240 张就是 240 次。同一趟重建里这份表不会变（同线程，重建期间没有写入口）。
@@ -735,6 +739,8 @@ class LibraryPanel(QWidget):
             path = str(e.get("path") or "")
             key = self.posters.request(path, float(e.get("dur") or 0))
             it.setData(Qt.UserRole + 1, key)
+            if key:
+                self._key_items[key] = it       # 封面回来时按这个键直查，不扫全表
             pm = self.posters.image(key)
             if pm is not None:
                 self.sync_decodes += 1
@@ -825,21 +831,21 @@ class LibraryPanel(QWidget):
     def _on_poster(self, key: str, ok: bool, _detail: str) -> None:
         """封面回来了：只换那一张的图标，不重建整表（重建会把用户的选中态弄丢）。
 
-        找到就停：一张封面只属于一行（key 由路径+大小+修改时间算出来），继续往下摸
-        只是把 O(行数) 白跑一遍。库里 3000 项、封面成批回来时，这一笔就是几百万次
-        无用的 item() 调用（2026-10-20 审查 B5；`poster_scans` 是给判据读的读数）。
+        `_key_items` 直查：一张封面只属于一行（key 由路径+大小+修改时间算出来），
+        旧写法逐行摸 `grid.item()` 是 O(行数)，库里 3000 项、封面成批回来时这一笔
+        就是几百万次无用调用（2026-10-20 审查 B5；`poster_scans` 是给判据读的读数，
+        命中一张仍记 1）。
         """
         if not ok:
+            return
+        it = self._key_items.get(key)
+        if it is None:
             return
         pm = self.posters.image(key)
         if pm is None:
             return
-        for i in range(self.grid.count()):
-            it = self.grid.item(i)
-            self.poster_scans += 1
-            if it.data(Qt.UserRole + 1) == key:
-                it.setIcon(QIcon(pm))
-                break
+        self.poster_scans += 1
+        it.setIcon(QIcon(pm))
 
     # ---------- 动作 ----------
     def _play(self, it: QListWidgetItem | None) -> None:

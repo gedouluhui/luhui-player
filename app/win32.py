@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import msvcrt
+import os
 import sys
 
 user32 = ctypes.windll.user32
@@ -17,6 +19,7 @@ WM_NCCALCSIZE = 0x0083
 WM_NCHITTEST = 0x0084
 WM_GETMINMAXINFO = 0x0024
 WM_WINDOWPOSCHANGED = 0x0047
+WM_DPICHANGED = 0x02E0
 WM_MOUSEWHEEL = 0x020A
 WM_LBUTTONDOWN = 0x0201
 WM_SETFOCUS = 0x0005
@@ -453,6 +456,80 @@ def screen_dpi(hwnd: int) -> int:
     return 96
 
 
+DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4   # 伪句柄，不是真 HANDLE
+
+
+def enable_per_monitor_v2() -> bool:
+    """把本进程的 DPI 感知升到 PerMonitorV2；必须在建任何窗口之前调。
+
+    为什么清单之外还要这一手：打包版的 exe 带 `app.manifest`（PerMonitorV2），
+    但开发态走的是 pythonw.exe，Python 自带的清单里没有 dpiAware——不补这一句，
+    150% 屏上 Qt 拿到的是 unaware 虚拟化尺寸，字号与原生子窗口一起发糊。
+    清单已经声明过时 API 会失败（ERROR_ACCESS_DENIED）；那表示进程已经是要的
+    口径，不当错误，继续尝试下一档只是兜底旧系统。
+    """
+    if is_per_monitor_v2():
+        return True
+    try:
+        user32.SetProcessDpiAwarenessContext.restype = wt.BOOL
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        if user32.SetProcessDpiAwarenessContext(
+                ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)):
+            return True
+    except Exception:
+        pass
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        if shcore.SetProcessDpiAwareness(2) == 0:      # PER_MONITOR_DPI_AWARE（v1）
+            return True
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware.restype = wt.BOOL
+        return bool(user32.SetProcessDPIAware())       # Vista 兜底：system aware
+    except Exception:
+        return False
+
+
+def dpi_awareness() -> int:
+    """当前进程档位：0=unaware 1=system 2=per-monitor；查不到按 0。"""
+    try:
+        user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.GetAwarenessFromDpiAwarenessContext.restype = wt.INT
+        user32.GetAwarenessFromDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        ctx = user32.GetThreadDpiAwarenessContext()
+        return int(user32.GetAwarenessFromDpiAwarenessContext(ctypes.c_void_p(ctx)))
+    except Exception:
+        pass
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        shcore.GetProcessDpiAwareness.restype = ctypes.c_long
+        shcore.GetProcessDpiAwareness.argtypes = [ctypes.c_void_p,
+                                                  ctypes.POINTER(ctypes.c_int)]
+        val = ctypes.c_int(-1)
+        if shcore.GetProcessDpiAwareness(None, ctypes.byref(val)) == 0:
+            return int(val.value)
+    except Exception:
+        pass
+    return 0
+
+
+def is_per_monitor_v2() -> bool:
+    """当前线程上下文是否 PMv2（Win10 1703 以下查不到 → False）。"""
+    try:
+        user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+        user32.AreDpiAwarenessContextsEqual.restype = wt.BOOL
+        user32.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        ctx = user32.GetThreadDpiAwarenessContext()
+        return bool(user32.AreDpiAwarenessContextsEqual(
+            ctypes.c_void_p(ctx),
+            ctypes.c_void_p(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)))
+    except Exception:
+        return False
+
+
 def remove_frame_styles(hwnd: int) -> None:
     """全屏时摘掉原生框架位（否则 DWM 还会给它圆角与阴影）。"""
     h = wt.HWND(hwnd)
@@ -522,3 +599,145 @@ def keep_awake(active: bool) -> None:
         kernel32.SetThreadExecutionState(wt.DWORD(flags))
     except Exception:
         pass
+
+
+# ---------- 子进程生命周期：Job Object ----------
+# `poolkit._CHILDREN` 只在**正常退出**那条路上杀得到孩子。主进程被 taskkill /F 或
+# Qt C++ 崩溃带走时，收尾代码一行都跑不到：mpv 继续放音、ffmpeg 继续写盘，用户看到
+# "窗口关了声音还在"。Job 带 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE，内核在最后一个
+# Job 句柄关闭时（= 本进程死亡，句柄被系统收走）终止 Job 内所有进程——不依赖我们
+# 执行任何 Python。句柄故意做成模块级且从不关闭：它的寿命就该等于本进程的寿命。
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_INFO_CLASS_EXTENDED = 9
+_PROCESS_ALL_ACCESS = 0x001F0FFF
+
+
+class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", wt.DWORD),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", wt.DWORD),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", wt.DWORD),
+        ("SchedulingClass", wt.DWORD),
+    ]
+
+
+class _IO_COUNTERS(ctypes.Structure):
+    _fields_ = [("ReadOperationCount", ctypes.c_uint64),
+                ("WriteOperationCount", ctypes.c_uint64),
+                ("OtherOperationCount", ctypes.c_uint64),
+                ("ReadTransferCount", ctypes.c_uint64),
+                ("WriteTransferCount", ctypes.c_uint64),
+                ("OtherTransferCount", ctypes.c_uint64)]
+
+
+class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+        ("IoInfo", _IO_COUNTERS),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+_JOB_HANDLE: int | None = None
+
+
+def _ensure_job() -> int | None:
+    global _JOB_HANDLE
+    if _JOB_HANDLE:
+        return _JOB_HANDLE
+    if sys.platform != "win32":
+        return None
+    kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wt.LPCWSTR]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    kernel32.SetInformationJobObject.restype = wt.BOOL
+    kernel32.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                                 ctypes.c_void_p, wt.DWORD]
+    if not kernel32.SetInformationJobObject(job, _JOB_INFO_CLASS_EXTENDED,
+                                            ctypes.byref(info), ctypes.sizeof(info)):
+        kernel32.CloseHandle(job)
+        return None
+    _JOB_HANDLE = job
+    return job
+
+
+def job_handle() -> int | None:
+    """本进程的 Job 句柄（验收脚本问用；None = 还没建/建失败）。"""
+    return _ensure_job()
+
+
+def assign_to_kill_job(pid_or_handle: int, is_pid: bool = True) -> bool:
+    """把一个进程放进本进程的 kill-on-close Job；失败返回 False，绝不抛。
+
+    调用点在每次 `Popen` 返回后立刻执行——窗口只有"刚起来"那一瞬，等它跑起来
+    再放就晚了。已退出/句柄拿不到都只是 False（孩子已经没了，没有要收的东西）。
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        job = _ensure_job()
+        if not job:
+            return False
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        kernel32.AssignProcessToJobObject.restype = wt.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = (kernel32.OpenProcess(_PROCESS_ALL_ACCESS, False, int(pid_or_handle))
+             if is_pid else pid_or_handle)
+        if not h:
+            return False
+        try:
+            return bool(kernel32.AssignProcessToJobObject(job, h))
+        finally:
+            if is_pid:
+                kernel32.CloseHandle(h)
+    except Exception:
+        return False
+
+
+# ---------- 文件句柄：允许别人改名/删除 ----------
+FILE_SHARE_READ = 0x00000001
+FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
+GENERIC_WRITE = 0x40000000
+OPEN_ALWAYS = 4
+FILE_ATTRIBUTE_NORMAL = 0x00000080
+INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+kernel32.CreateFileW.restype = ctypes.c_void_p
+kernel32.CreateFileW.argtypes = [wt.LPCWSTR, wt.DWORD, wt.DWORD, ctypes.c_void_p,
+                                 wt.DWORD, wt.DWORD, ctypes.c_void_p]
+
+
+def open_append_share_delete(path: str):
+    """以追加写打开文件，但允许别的进程/线程改名、删除它。
+
+    为什么不用内置 `open`：Windows 上 CRT 的共享模式只有 READ|WRITE，不含
+    FILE_SHARE_DELETE——句柄开着时 `os.replace` 一律 ERROR_SHARING_VIOLATION。
+    crash.log 的轮转正是被 faulthandler 的常开句柄这样卡死的（实测：连写 6 次
+    一次都没轮转）。这里把删除共享放出来，日志句柄才不会和轮转互相锁死。
+    """
+    h = kernel32.CreateFileW(path, GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             None, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, None)
+    if not h or h == INVALID_HANDLE_VALUE:
+        raise OSError(f"CreateFileW 失败 GetLastError={kernel32.GetLastError()}")
+    try:
+        fd = msvcrt.open_osfhandle(h, os.O_APPEND | os.O_WRONLY)
+    except Exception:
+        kernel32.CloseHandle(h)
+        raise
+    return os.fdopen(fd, "a", encoding="utf-8", errors="backslashreplace")

@@ -1026,4 +1026,9 @@ if __name__ == "__main__":
     if left:
         rc = 3                     # 收尾没排空：这轮的数不算功能结论
     shutil.rmtree(TMP, ignore_errors=True)
-    sys.exit(rc)
+    # 判据与线程池都收完了还让解释器走正常析构，Qt 对象与 Python GC 的先后顺序
+    # 在 Windows 上会随机踩空（0xC0000005）。进程走到这里，结论已经在屏幕上，
+    # 直接按 rc 交账，不让收尾段的段错误改写结论（收尾前的大小写检查仍照跑）。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(rc)

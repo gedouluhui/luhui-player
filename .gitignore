@@ -22,6 +22,7 @@ runtime/
 # ---- 测试现场（日志、截图、临时数据、样片视频）----
 tests/out/
 tests/logs/
+tests/hardening-*/
 .selftest-data*/
 tests/.selftest*/
 tests/.probe*/
@@ -34,6 +35,11 @@ tests/.scrollapp/
 *.wav
 *.avi
 *.mov
+
+# 离线判据的三支合成样片是固定素材（不是用户视频）：单独放行，保证干净 checkout 也跑得动
+!tests/samples/gelu-sample-1.mp4
+!tests/samples/gelu-sample-2.mp4
+!tests/samples/gelu-sample-3.mkv
 
 # ---- 内部交账与临时凭据 ----
 docs/交账-*.md

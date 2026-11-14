@@ -98,7 +98,7 @@ class FakePlayer:
 def make_win(player: FakePlayer):
     w = mw.MainWindow.__new__(mw.MainWindow)
     w.player = player
-    w._pending_subs = []
+    w._pending_subs = None
     w.said: list[str] = []
     w.receipts: list[tuple] = []
     w.settles: list[tuple] = []
@@ -130,10 +130,14 @@ def run(paths: list[str], *, path: str = "", plays: bool = True, running: bool =
     mw.win32.keep_awake = lambda *_a, **_k: None      # 这条链不验防睡眠，别碰系统状态
     try:
         mw.MainWindow.add_paths(w, paths, replace=replace)
-        after_drop = {"pending": list(w._pending_subs), "subs": list(p.subs),
+        after_drop = {"pending": list(w._pending_subs[1]) if w._pending_subs else [],
+                      "subs": list(p.subs),
                       "opened": list(p.opened), "said": list(w.said)}
         if loaded:
-            p._path = p._path or (paths[0] if paths else "")
+            # 内核推回来的 path 是**视频**那条；字幕先拖时 paths[0] 是字幕，
+            # 拿它冒充会让"目标片对得上"的守卫（正确地）拒绝挂字幕。
+            p._path = p._path or next(
+                (x for x in paths if not mw.is_sub_file(x)), paths[0] if paths else "")
             mw.MainWindow._on_file_loaded(w)
     except BaseException as e:                 # 量具崩了也要把类型带回来，不许整趟没了
         exc = f"{type(e).__name__}: {e}"
@@ -141,7 +145,8 @@ def run(paths: list[str], *, path: str = "", plays: bool = True, running: bool =
     finally:
         mw.win32.keep_awake = orig_keep
     return {"exc": exc, "after_drop": after_drop,
-            "pending": list(w._pending_subs), "subs": list(p.subs),
+            "pending": list(w._pending_subs[1]) if w._pending_subs else [],
+                      "subs": list(p.subs),
             "opened": list(p.opened), "said": list(w.said), "settles": list(w.settles)}
 
 
@@ -311,7 +316,7 @@ def falsify() -> int:
         self.empty.set_notice("")
         self.empty.setVisible(False)
         res = self.player.open_files(files, append=not replace, remember=True) or {}
-        self._pending_subs = list(subs)
+        self._pending_subs = (str(res.get("head", "")), list(subs))
         self._arm_open_receipt(int(res.get("count", 0)), bool(res.get("plays")),
                                str(res.get("head", "")))
 

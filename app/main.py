@@ -17,8 +17,10 @@
 from __future__ import annotations
 
 import datetime
+import faulthandler
 import os
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -29,6 +31,7 @@ from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from . import config as cfgmod
+from . import win32
 from .engine import poolkit
 from .ui import theme
 from .ui.main_window import SHUTDOWN_GRACE_MS, MainWindow
@@ -42,8 +45,67 @@ LAUNCH_LOG_KEEP = 400                             # launch.log 只留最后这�
 SEEN_KEEP = 64                                    # nonce 去重表长度（重投保护，不是审计日志）
 
 
+CRASH_LOG_MAX = 2 * 1024 * 1024      # 单份上限：2 MiB
+CRASH_LOG_KEEP = 3                   # 归档保留份数（crash.log.1 .. .3）
+_CRASH_FH = None                     # faulthandler 常开的句柄（进程级唯一，别关）
+
+
 def crash_log_path() -> str:
     return os.path.join(cfgmod.LOG_DIR, "crash.log")
+
+
+def _rotate_crash(path: str, limit: int, keep: int) -> None:
+    """crash.log 超过 limit 就改名归档：.1 最新，最多 keep 份，更老的丢掉。
+
+    无上限追加的问题不是"占点盘"，而是几个月后崩溃现场被埋进几十 MB 的旧记录里，
+    真正要看的那一段反而找不到。轮转在每次写入前做，代价是一次 getsize。
+    """
+    try:
+        if os.path.getsize(path) < limit:
+            return
+    except OSError:
+        return                          # 文件还不存在 / 读不到：没什么可轮转的
+    for i in range(keep, 0, -1):
+        src = path if i == 1 else f"{path}.{i - 1}"
+        if os.path.exists(src):
+            try:
+                os.replace(src, f"{path}.{i}")      # Windows 上 os.replace 会覆盖旧归档
+            except OSError:
+                return
+
+
+def _append_crash(text: str) -> None:
+    """往 crash.log 追加一段（带轮转 + fsync）；任何失败都吞掉——记日志不许弄死程序。"""
+    path = crash_log_path()
+    try:
+        os.makedirs(cfgmod.LOG_DIR, exist_ok=True)
+        _rotate_crash(path, CRASH_LOG_MAX, CRASH_LOG_KEEP)
+        with open(path, "a", encoding="utf-8", errors="backslashreplace") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())        # 崩的时候不 fsync，断电/被收尸都可能丢最后一条
+    except Exception:
+        pass
+
+
+def _thread_excepthook(args) -> None:
+    """后台线程未处理异常落盘，再交给默认打印机（stderr 那份行为不变）。"""
+    name = getattr(getattr(args, "thread", None), "name", "?")
+    try:
+        body = "".join(traceback.format_exception(args.exc_type, args.exc_value,
+                                                  args.exc_traceback))
+    except Exception:
+        body = f"{args.exc_type}: {args.exc_value}\n"
+    _append_crash(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} "
+                  f"线程={name} ====\n{body}")
+    try:
+        threading.__excepthook__(args)      # stderr 那份行为不变
+    except Exception:
+        # 本机默认钩子只认真 ExceptHookArgs；别的形状（判据里注入的假参数）退到通用打印机。
+        try:
+            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+        except Exception:
+            pass
 
 
 def install_crash_log() -> str:
@@ -54,27 +116,60 @@ def install_crash_log() -> str:
     退出码 127、stdout/stderr 全空。用户那边只看到"播放器突然没了"，什么线索都没有。
     （真实踩过：floaters.paintEvent 里对 QRect 调 .toRect()。）落盘这一份是唯一能事后
     查证的证据，所以要在建窗口之前装好。
+
+    三种崩溃三种入口，缺一不可：
+      · 主线程 Python 异常 → `sys.excepthook`；
+      · 后台线程 Python 异常（IPC 读线程、线程池里漏出来的）→ `threading.excepthook`；
+      · C/C++ 层致命崩溃（Qt 访问违例、段错误）→ Python 钩子根本轮不到，
+        只能靠 `faulthandler` 在信号处理器里把所有线程的栈直接写 fd。
+    faulthandler 用一条常开句柄；轮转只搬名字不搬句柄，所以归档之后它写进的是 .1——
+    仍在日志目录、仍受轮转封顶，换来"崩溃那一刻一定有栈"。
     """
+    global _CRASH_FH
     default_hook = sys.excepthook
 
     def hook(etype, value, tb):
         try:
-            os.makedirs(cfgmod.LOG_DIR, exist_ok=True)
-            with open(crash_log_path(), "a", encoding="utf-8") as f:
-                f.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ====\n")
-                traceback.print_exception(etype, value, tb, file=f)
-                f.flush()
-                os.fsync(f.fileno())
+            body = "".join(traceback.format_exception(etype, value, tb))
         except Exception:
-            pass        # 记日志本身不许再把程序弄死
+            body = f"{etype}: {value}\n"
+        _append_crash(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} ====\n"
+                      f"{body}")
         default_hook(etype, value, tb)
 
     sys.excepthook = hook
+    threading.excepthook = _thread_excepthook
+    if _CRASH_FH is None:
+        try:
+            os.makedirs(cfgmod.LOG_DIR, exist_ok=True)
+            # 这条句柄要活到进程结束，必须允许轮转改名（见 win32 里的说明）。
+            _CRASH_FH = win32.open_append_share_delete(crash_log_path())
+        except OSError:
+            _CRASH_FH = None
+    if _CRASH_FH is not None:
+        try:
+            faulthandler.enable(file=_CRASH_FH, all_threads=True)
+        except Exception:
+            pass
     return crash_log_path()
 
 
 def _enable_high_dpi() -> None:
-    """必须在 QApplication 构造之前设，否则 150% 缩放机上全是模糊/错位。"""
+    """必须在 QApplication 构造之前设，否则 150% 缩放机上全是模糊/错位。
+
+    顺序也是契约的一部分：PerMonitorV2 要在 Qt 建窗之前落到进程上，PassThrough
+    要在 QApplication 创建之前设——Qt 只读一次，晚一步就退回默认的 Round（125% /
+    175% 会被折成整数倍，整个界面尺寸对不上）。PyQt5 5.15.2 有这条策略；更老的
+    绑定没有就跳过，别因此起不来。
+    """
+    win32.enable_per_monitor_v2()
+    policy = getattr(Qt, "HighDpiScaleFactorRoundingPolicy", None)
+    setter = getattr(QApplication, "setHighDpiScaleFactorRoundingPolicy", None)
+    if policy is not None and setter is not None:
+        try:
+            setter(policy.PassThrough)
+        except Exception:
+            pass
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
@@ -579,6 +674,9 @@ def main(argv: list[str] | None = None) -> int:
     # 调色板还要单独给一份深色的（QSS 管不到对勾、下拉箭头、禁用字色这些 Qt 自绘零件）。
     theme.install(app, str(cfg["theme_accent"]))
     cfgmod.ensure_dirs(cfg)
+    # 上次若是被强杀/崩溃带走，缓存里会留半张封面（*.part.jpg）和写了一半的 *.tmp；
+    # 此刻单实例已成立，不会跟任何在写的任务抢文件，正是清扫的唯一安全时机。
+    cfgmod.sweep_cache_temp()
     log_launch("cold", argv, kept, dropped, ignored)
     problems = startup_checks()
 

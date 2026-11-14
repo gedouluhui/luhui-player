@@ -59,8 +59,25 @@ WAIT_TIMEOUT = 258
 WAIT_FAILED = 0xFFFFFFFF
 INFINITE = 0xFFFFFFFF
 READ_SIZE = 65536
-# 关闭/超时时仍可能在途的缓冲区：钉住不放，防止内核往已释放内存写
+# 单行上限：mpv 的 JSON 事件都在几十 KB 以内（播放列表上千条也远小于 1 MiB）。
+# 对端一旦输出无换行的巨行（损坏/被替换成别的进程/恶意写管道），没有这条闸门
+# `buf += chunk` 就是无界增长——断连比吃满内存诚实。
+MAX_LINE_BYTES = 4 * 1024 * 1024
+# 关闭/超时时仍可能在途的缓冲区：钉住不放，防止内核往已释放内存写。
+# 越线要留告警：正常播放一年也不该出现一条，出现即说明关闭路径在反复超时。
+LEAK_ALERT = 64
 _LEAKED: list[tuple] = []
+_LEAK_ALERTED = False
+
+
+def _pin_leaked(buf: Any, ov: Any) -> None:
+    """钉住一个可能仍被内核写入的缓冲区；数量越过阈值只报一次（日志要有信号不许刷屏）。"""
+    global _LEAK_ALERTED
+    _LEAKED.append((buf, ov))
+    if len(_LEAKED) > LEAK_ALERT and not _LEAK_ALERTED:
+        _LEAK_ALERTED = True
+        print(f"[ipc] 在途管道缓冲区已钉住 {len(_LEAKED)} 个（阈值 {LEAK_ALERT}）："
+              f"关闭/超时路径可能在反复泄漏，检查管道对端", file=sys.stderr)
 
 
 class _Overlapped(ctypes.Structure):
@@ -218,10 +235,10 @@ class WinPipe:
                     raise OSError(f"WriteFile 失败 GetLastError={err}")
                 sig = self._wait2(ev, 10.0)
                 if sig == WAIT_OBJECT_0 + 1:
-                    _LEAKED.append((buf, ov))
+                    _pin_leaked(buf, ov)
                     raise OSError("管道已停止")
                 if sig == WAIT_TIMEOUT:
-                    _LEAKED.append((buf, ov))
+                    _pin_leaked(buf, ov)
                     raise OSError("WriteFile 超时（管道背压 10s 未消化）")
                 if sig != WAIT_OBJECT_0:
                     raise OSError(f"等待写完成失败 GetLastError={_kernel32.GetLastError()}")
@@ -242,7 +259,7 @@ class WinPipe:
                 pass
             # 挂起的读无法取消：把它引用的缓冲区钉住，防止内核写入已释放内存
             if self._pending is not None:
-                _LEAKED.append((self._pending[0], self._pending[1]))
+                _pin_leaked(self._pending[0], self._pending[1])
                 self._pending = None
             try:
                 _kernel32.CancelIoEx(self.h, None)   # 尽力而为，不作为退出依赖
@@ -268,6 +285,7 @@ class MpvIpc:
         self._ids = itertools.count(1)
         self._reader: threading.Thread | None = None
         self._writer: threading.Thread | None = None
+        self._proc = None                           # mpv 进程（协议损坏时要能请它重启）
         self._outq: queue.SimpleQueue = queue.SimpleQueue()
         self._alive = False
         self._closing = False
@@ -275,6 +293,9 @@ class MpvIpc:
         self._obs_callbacks: dict[int, Callable] = {}
         self._event_callbacks: dict[str, list[Callable]] = {}
         self._any_event_callbacks: list[Callable] = []
+        # 回调名册的锁：注册发生在 UI 线程，遍历发生在读线程。快照在锁内取、调用在锁外做——
+        # 回调里再注册/发请求都是常态，握着锁回调就是把两条线程焊死。
+        self._cb_lock = threading.RLock()
         self.stats = {"sent": 0, "received": 0, "events": 0, "timeouts": 0, "errors": 0,
                       "reconnects": 0, "rtt_ms_max": 0.0, "rtt_ms_sum": 0.0, "rtt_n": 0}
 
@@ -287,6 +308,8 @@ class MpvIpc:
         """
         if self._reader is not None:
             return True
+        if proc is not None:
+            self._proc = proc
         dead = (lambda: proc.poll() is not None) if proc is not None else None
         if not self._pipe.try_open(dead=dead):
             return False
@@ -305,6 +328,8 @@ class MpvIpc:
         self._writer.start()
 
     def connect(self, timeout: float = 8.0, proc=None) -> bool:
+        if proc is not None:
+            self._proc = proc
         dead = (lambda: proc.poll() is not None) if proc is not None else None
         self._pipe.open(timeout, dead=dead)
         self.start_io()
@@ -450,31 +475,39 @@ class MpvIpc:
 
     # ---------------- 观察 ----------------
     def observe(self, name: str, callback: Callable[[Any], None]) -> None:
-        if name in self._observers:
-            self._obs_callbacks[self._observers[name]] = callback
-            return
-        mid = next(self._ids)
-        self._observers[name] = mid
-        self._obs_callbacks[mid] = callback
-        if self._alive:
+        with self._cb_lock:
+            if name in self._observers:
+                self._obs_callbacks[self._observers[name]] = callback
+                return
+            mid = next(self._ids)
+            self._observers[name] = mid
+            self._obs_callbacks[mid] = callback
+            alive = self._alive
+        # 请求放在锁外：request() 会等应答，而应答要靠读线程投递，读线程派发时又要这把锁。
+        if alive:
             self.request(["observe_property", mid, name], timeout=2.0)
 
     def reobserve_all(self) -> None:
-        for name, mid in list(self._observers.items()):
+        with self._cb_lock:
+            pairs = list(self._observers.items())
+        for name, mid in pairs:
             try:
                 self.request(["observe_property", mid, name], timeout=1.0)
             except IpcError:
                 pass
 
     def on(self, event: str, callback: Callable[[dict], None]) -> None:
-        self._event_callbacks.setdefault(event, []).append(callback)
+        with self._cb_lock:
+            self._event_callbacks.setdefault(event, []).append(callback)
 
     def on_any_event(self, callback: Callable[[dict], None]) -> None:
-        self._any_event_callbacks.append(callback)
+        with self._cb_lock:
+            self._any_event_callbacks.append(callback)
 
     # ---------------- 接收 ----------------
     def _read_loop(self) -> None:
         buf = bytearray()
+        overflow = False
         while self._alive:
             try:
                 chunk = self._pipe.read(timeout=0.5)
@@ -488,6 +521,13 @@ class MpvIpc:
             while True:
                 nl = buf.find(b"\n")
                 if nl < 0:
+                    # 找完整块都没有换行：单行超过上限就断开——这是"对端不再像 mpv"
+                    # 的信号（损坏/被顶替/有人往管道里灌数据），继续缓存只会吃满内存。
+                    if len(buf) > MAX_LINE_BYTES:
+                        overflow = True
+                        self.stats["errors"] += 1
+                        print(f"[ipc] 单行超过 {MAX_LINE_BYTES} 字节仍无换行，断开连接",
+                              file=sys.stderr)
                     break
                 line = bytes(buf[:nl]).strip()
                 del buf[: nl + 1]
@@ -499,9 +539,26 @@ class MpvIpc:
                     self.stats["errors"] += 1
                     continue
                 self._dispatch(msg)
+            if overflow:
+                break
         self._alive = False
+        if overflow:
+            buf.clear()
+            try:
+                self._pipe.close()      # 收口这条连接
+            except Exception:
+                pass
+            # 断开的重连路径：请内核体面退出，上层看门狗（player._start_watchdog）
+            # 会按既有流程重启并恢复播放位置。只关管道不杀内核的话，进程还在放音、
+            # 命令却一条也发不出去，界面表现为"活着但不听话"。
+            proc = self._proc
+            try:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+            except Exception:
+                pass
         if not self._closing:
-            self._fail_pending("IPC 读线程已退出")
+            self._fail_pending("IPC 单行超限，连接已断开" if overflow else "IPC 读线程已退出")
 
     def _dispatch(self, msg: dict) -> None:
         self.stats["received"] += 1
@@ -517,15 +574,22 @@ class MpvIpc:
 
         event = msg.get("event")
         if event in ("properties-changed", "property-change"):
-            cb = self._obs_callbacks.get(msg.get("id"))
+            with self._cb_lock:
+                cb = self._obs_callbacks.get(msg.get("id"))
             if cb:
                 self.stats["events"] += 1
                 _safe(cb, msg.get("data"))
         if event:
             self.stats["events"] += 1
-            for cb in self._event_callbacks.get(event, []):
+            # 快照迭代：这一帧开始之后才注册的回调从下一帧生效。旧写法直接遍历活列表，
+            # 回调里再注册回调会**当场**被这一帧调用（同一事件重复触发），而且和 UI 线程
+            # 的注册共享同一容器，行为要靠 GIL 的巧合。锁只圈住拷贝，调用在锁外。
+            with self._cb_lock:
+                cbs = list(self._event_callbacks.get(event, ()))
+                any_cbs = list(self._any_event_callbacks)
+            for cb in cbs:
                 _safe(cb, msg)
-            for cb in self._any_event_callbacks:
+            for cb in any_cbs:
                 _safe(cb, msg)
 
 

@@ -10,6 +10,14 @@ import os
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 NAME = "LuHui播放器"
 
+# 外部二进制零盲信：开打之前先按仓库里的 checksums.sha256 核对 mpv/ffmpeg。
+# 换内核版本时同步更新 packaging/runtime_checksums.sha256，否则这里会停下。
+import sys as _sys
+_sys.path.insert(0, os.path.join(ROOT, "packaging"))
+from verify_runtime import verify as _verify_runtime  # noqa: E402
+
+_verify_runtime(ROOT)
+
 assets = os.path.join(ROOT, "packaging", "assets")
 runtime = os.path.join(ROOT, "runtime")
 
@@ -69,6 +77,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     icon=os.path.join(assets, "app.ico"),
+    manifest=os.path.join(ROOT, "packaging", "app.manifest"),
     version=os.path.join(ROOT, "packaging", "portable_version.txt"),
 )
 

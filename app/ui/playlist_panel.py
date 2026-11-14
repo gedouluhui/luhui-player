@@ -439,7 +439,7 @@ class PlaylistPanel(QWidget):
         self.list.clear()
         for i, it in enumerate(self._items):
             # mpv 的 playlist[].filename 是**完整路径/URL**，直接当标题会让侧栏变成
-            # 一列 C:\Users\... 的截断串（真机截图目检发现）。成熟播放器一律
+            # 一列截断的盘符路径（真机截图目检发现）。成熟播放器一律
             # "元数据标题优先，没有就取文件名"，完整路径放 tooltip。
             path = self._entry_path(it)
             name = str(it.get("title") or "").strip() or os.path.basename(path.rstrip("/"))

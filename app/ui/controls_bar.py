@@ -469,10 +469,9 @@ class ControlsBar(QWidget):
         self._dragging = dragging
 
     def _on_seek(self, sec: float, exact: bool) -> None:
-        if exact:
-            self.p.seek_abs(sec)
-        else:
-            self.p.seek_abs(sec)      # 拖动中同样用绝对定位：相对 seek 会累积成飘
+        # exact 原样交给内核：拖动途中 keyframes 档（便宜、跟手），松手 absolute+exact
+        # （用户放下的那一帧必须精确）。旧写法两条分支一模一样，等于把精确档吞了。
+        self.p.seek_abs(sec, exact=exact)
         self.lbl_time.setText(f"{fmt_time(sec)} / {fmt_time(self.scrub._dur)}")
 
     def _on_pause(self, paused: bool) -> None:

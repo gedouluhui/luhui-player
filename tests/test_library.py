@@ -431,9 +431,9 @@ def main() -> int:
     left_names = names([x["path"] for x in lib2.items()])
     check("forget 同时摘掉条目和索引（下次扫描不会带着旧时长复活），未知路径返回 False",
           ok_forget is True and len(lib2.items()) == n_before - 1
-          and victim not in lib2._index and "tone.mp4" not in left_names
+          and LB._norm_path(victim) not in lib2._index and "tone.mp4" not in left_names
           and lib2.forget(os.path.join(BASE, "根本没这个.mp4")) is False,
-          f"{n_before}→{len(lib2.items())} 索引还在={victim in lib2._index}")
+          f"{n_before}→{len(lib2.items())} 索引还在={LB._norm_path(victim) in lib2._index}")
 
     # 「移除」只改内存的话，本次会话里看着删了、重启又整条复活——而界面上根本没有
     # "正在保存"这一档。所以判据不看内存，看**从盘上重新读回来的那一份**。
@@ -449,16 +449,17 @@ def main() -> int:
     direct = os.path.join(TREE, "direct.mp4")
     lib2._index[direct] = {"size": 1, "mtime": 1.0, "dur": 2.0}
     removed = lib2.remove_root(TREE)
-    # 判据自己也得带分隔符：startswith(TREE) 会把 tree2 也算成"tree 剩下的人"，
-    # 于是这条会变成"测试误判实现"而不是"实现误删索引"。
-    purged = [k for k in lib2._index if k.startswith(TREE + os.sep)]
+    # 判据用产品自己的前缀判据（带分隔符 + 规范形）：裸 startswith(TREE) 会把 tree2
+    # 也算成"tree 剩下的人"，而对规范形键做裸 startswith 又会因盘符大小写漏判。
+    purged = [k for k in lib2._index if LB._is_under(k, TREE)]
     check("remove_root 连带清掉该根下的索引（含直属文件），兄弟前缀目录不误伤",
           removed is True and not purged and direct not in lib2._index
           and fake_sibling in lib2._index,
           f"残留={len(purged)} 直属={direct in lib2._index} 兄弟保留={fake_sibling in lib2._index}")
     lib2_again = LB.Library(FFMPEG, INDEX, [TREE])
+    # 索引键从盘上读回来时统一成规范形（normcase+normpath，见审计 3.3），比较也要按规范形。
     check("remove_root 也真落盘：盘上只剩兄弟目录那一条，直属文件不残留",
-          set(lib2_again._index) == {fake_sibling},
+          set(lib2_again._index) == {LB._norm_path(fake_sibling)},
           f"盘上 {len(lib2_again._index)} 条：{sorted(os.path.basename(k) for k in lib2_again._index)}")
     check("remove_root 对不在库里的路径返回 False",
           lib2.remove_root(os.path.join(BASE, "没加过")) is False)

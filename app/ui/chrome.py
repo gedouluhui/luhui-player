@@ -26,7 +26,7 @@ from __future__ import annotations
 import ctypes
 import ctypes.wintypes as wt
 
-from PyQt5.QtCore import QAbstractNativeEventFilter, QCoreApplication, Qt
+from PyQt5.QtCore import QAbstractNativeEventFilter, QCoreApplication, Qt, QTimer
 from PyQt5.QtWidgets import QWidget
 
 from .. import win32
@@ -55,6 +55,10 @@ class Chrome(QAbstractNativeEventFilter):
         self._hwnd: int | None = None         # 安装时记下的 HWND：消息比对用它，不再回身调 self.w
         self.last_error: str | None = None    # nativeEvent 里兜住的异常（自检页会读）
         self.seen: dict[int, int] = {}        # 每条本管消息的计数：为 0 就说明过滤器根本没跑
+        # WM_DPICHANGED 之后要校准 mpv 原生子窗口（Qt 不管它）。回调由 MainWindow 接：
+        # 0ms 一拍先按新物理尺寸铺一次，80ms 再兜一拍——跨屏拖动时系统会在窗口落定
+        # 前后各发一次，布局的最终几何不一定在第一拍就绪。
+        self.on_dpi_changed = None
 
     # ---------- 安装 ----------
     def install(self) -> None:
@@ -135,6 +139,15 @@ class Chrome(QAbstractNativeEventFilter):
         if self._hwnd is None or not msg.hwnd or int(msg.hwnd) != int(self._hwnd):
             return False, 0
         self.seen[msg.message] = self.seen.get(msg.message, 0) + 1
+        if msg.message == win32.WM_DPICHANGED:
+            # 放行（False）：新位置/尺寸 Qt 自己会用建议矩形落地。回调只负责把 mpv
+            # 的原生子窗口按**新**客户区物理宽高再铺一次；`--wid` 的子窗口不跟随
+            # 父窗缩放，不补这一下就是"跨屏之后画面缩在左上角/大出一块"。
+            cb = self.on_dpi_changed
+            if cb is not None:
+                QTimer.singleShot(0, cb)
+                QTimer.singleShot(80, cb)
+            return False, 0
         if msg.message == win32.WM_NCCALCSIZE:
             return self._on_nccalcsize(msg)
         if msg.message == win32.WM_NCHITTEST:

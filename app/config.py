@@ -371,3 +371,35 @@ def ensure_dirs(cfg: Config) -> None:
             os.makedirs(d, exist_ok=True)
         except Exception:
             pass
+
+
+def same_media_path(a: str, b: str) -> bool:
+    """两个路径是否指同一个文件（与「最近播放」用同一套规范形）。空串一律不相等。
+
+    用途是"这一批字幕/进度是给哪支片的"：快速 A→B 连切时，A 的 file-loaded 回包
+    可能比 B 的晚到，拿原字符串比会把 A 的字幕挂到 B 上。只做比较，不碰文件系统。
+    """
+    ka, kb = Config.recent_key(a or ""), Config.recent_key(b or "")
+    return bool(ka) and ka == kb
+
+
+def sweep_cache_temp(cache_dir: str | None = None) -> int:
+    """清掉缓存里上次"非正常死亡"留下的半成品：`*.part.jpg`（封面写了一半）与 `*.tmp`。
+
+    为什么值得在启动时扫：封面任务先写 `<out>.part.jpg` 再 `os.replace` 成成品；主进程
+    被 `taskkill /F` 或崩溃带走时，一半的 jpg 就永远留在盘上——它不会被 `ready()` 认成
+    成品（文件名不同），却会一直占着体积，而"启动时顺手清"是唯一不需要另一条清理
+    线程/计时器的时机（此刻单实例保证没有别的本程序在写这些文件）。
+    删不掉（被占用/权限）就跳过：这是打扫，不是启动的硬依赖。
+    """
+    root = cache_dir or CACHE_DIR
+    n = 0
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            if fn.endswith(".part.jpg") or fn.endswith(".tmp"):
+                try:
+                    os.remove(os.path.join(dirpath, fn))
+                    n += 1
+                except OSError:
+                    pass
+    return n

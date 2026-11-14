@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import time
+
 from PyQt5.QtCore import QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QSizePolicy, QWidget
@@ -29,6 +31,14 @@ class Scrubber(QWidget):
 
     THICK = 3.0
     HOT = 22.0        # 命中区比可见轨道厚，好拖
+    # 拖动节流的间隔：鼠标一次快速滑动能产生几百个 move 事件，每个都发 seek 会把
+    # IPC 写队列和内核定位命令灌满（拖动反而变得一顿一顿）。60ms ≈ 16 次/秒，
+    # 肉眼看到的跟随仍然连续，而内核每次要处理的关键帧 seek 少了一个数量级。
+    DRAG_EMIT_MIN = 0.06
+    # 松手后这段时间内，管道里在途的旧 time-pos（拖动开始前的值）会晚到；它离目标
+    # 很远时一定是陈旧回写，丢弃。窗口只开 0.22s：真内核在这段时间内已经回报新位置。
+    SEEK_GUARD = 0.22
+    REBOUND_TOL = 0.6     # "离目标多远才算陈旧"（秒）：正常的属性推送误差远小于它
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -49,12 +59,24 @@ class Scrubber(QWidget):
         self._hover_x: int | None = None
         self._dragging = False
         self._drag_pos = 0.0
+        self._last_drag_emit = 0.0
+        # 松手 seek 的"目标点 + 守卫截止时刻"：见 set_state 里丢弃陈旧回写那一段。
+        self._seek_target = 0.0
+        self._seek_guard_until = 0.0
 
     # ---------- 外部喂数据 ----------
     def set_state(self, pos: float, dur: float) -> None:
         if self._dragging:
             return
-        self._pos, self._dur = float(pos or 0), float(dur or 0)
+        pos, dur = float(pos or 0), float(dur or 0)
+        # 防回弹：松手 seek 之后，管道里还在路上的旧 time-pos 会把进度条短暂拉回
+        # 拖动前的位置（用户看到"松手后跳一下再回来"）。守卫窗口内只要离目标超过
+        # REBOUND_TOL 就判定为陈旧回写；目标附近的真实值照常采纳。
+        if (time.monotonic() < self._seek_guard_until
+                and abs(pos - self._seek_target) > self.REBOUND_TOL):
+            self._dur = dur
+            return
+        self._pos, self._dur = pos, dur
         self.update()
 
     def set_buffered(self, seconds: float) -> None:
@@ -105,6 +127,7 @@ class Scrubber(QWidget):
             self._drag_pos = self._sec_at(ev.pos().x())
             self.sig_drag_state.emit(True)
             self.sig_seek.emit(self._drag_pos, False)
+            self._last_drag_emit = time.monotonic()
             self._emit_preview(ev.pos().x())
             self.update()
             ev.accept()
@@ -112,7 +135,11 @@ class Scrubber(QWidget):
     def mouseMoveEvent(self, ev):
         if self._dragging:
             self._drag_pos = self._sec_at(ev.pos().x())
-            self.sig_seek.emit(self._drag_pos, False)
+            now = time.monotonic()
+            if now - self._last_drag_emit >= self.DRAG_EMIT_MIN:
+                self._last_drag_emit = now
+                self.sig_seek.emit(self._drag_pos, False)
+            # 预览/绘制每帧都跟手：只有"发给内核的 seek"需要节流，光标与气泡不需要。
             self._emit_preview(ev.pos().x())
             self.update()
         else:
@@ -131,8 +158,13 @@ class Scrubber(QWidget):
 
     def mouseReleaseEvent(self, ev):
         if self._dragging and ev.button() == Qt.LeftButton:
+            target = self._sec_at(ev.pos().x())
             self._dragging = False
-            self.sig_seek.emit(self._sec_at(ev.pos().x()), True)   # 松手定帧：精确 seek
+            # 松手这一下不等节流：用户放下的位置就是他要看的帧，必须精确且立刻生效。
+            self._pos = target
+            self._seek_target = target
+            self._seek_guard_until = time.monotonic() + self.SEEK_GUARD
+            self.sig_seek.emit(target, True)   # 松手定帧：精确 seek
             self.sig_drag_state.emit(False)
             if not self.underMouse():
                 self.sig_hover_end.emit()
