@@ -267,7 +267,7 @@ def d8_offline_runner() -> None:
     need = ("test_hardening.py", "test_subtitle_drop.py", "test_responsiveness.py",
             "test_win_geom.py", "test_dpi_ci.py", "test_equalizer.py")
     probes = ("test_engine.py", "test_ui.py", "test_gif_real.py", "test_thumbs.py",
-              "test_transform.py", "test_engine_async_real.py")
+              "test_transform.py", "test_engine_async_real.py", "test_usage.py")
     local = ("test_library.py", "test_shutdown_quiet.py", "test_instance.py",
              "test_launchers.py")
     missing = [n for n in need if n not in out]

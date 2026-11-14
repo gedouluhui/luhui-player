@@ -52,7 +52,6 @@ SUITE = [
     "test_round25.py",          # R25 四轴离线判据
     "test_subtitle_drop.py",    # 字幕拖入路由
     "test_ui_polish.py",        # 窄窗控制条与按钮态（offscreen）
-    "test_usage.py",            # 资源实测
     "test_fs_chrome_offline.py",# 全屏 chrome 状态机
     "test_engine_async.py",     # 内核启动排队/失败告知（假内核）
 ]
@@ -61,6 +60,7 @@ SUITE = [
 PROBE = [
     "test_engine.py", "test_engine_async_real.py", "test_gif.py",
     "test_gif_real.py", "test_thumbs.py", "test_transform.py", "test_ui.py",
+    "test_usage.py",            # psutil + nvidia-smi；runner 没 GPU，环境门禁退 2
     # 下面四份要本机素材或本地留底，干净 checkout 里没有：
     "test_library.py",          # 真 ffmpeg 探测时长/封面
     "test_shutdown_quiet.py",   # 真 ffmpeg + 4K 样片做在途收口
@@ -109,6 +109,17 @@ def run_one(name: str, data_root: str, timeout: int, verbose: bool) -> tuple[str
     return f"FAIL(rc={rc}, {dt:.1f}s)", rc, out
 
 
+def annotate_failure(name: str, out: str) -> None:
+    """把失败判据写成 GitHub 注解；否则日志未登录不可见，只能看到一个笼统的 rc=1。"""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    lines = out.splitlines()
+    hits = [x.strip() for x in lines if x.lstrip().startswith("[FAIL]")]
+    detail = " | ".join(hits[:8]) or (lines[-1].strip() if lines else "没有输出")
+    detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print(f"::error title={name}::{detail[:900]}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="离线回归套件跑者")
     ap.add_argument("--list", action="store_true", help="列出 unit/probe 清单后退出")
@@ -143,6 +154,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"PASS={passes} FAIL={fails}")
             if rc != 0:
                 bad.append((name, out))
+                annotate_failure(name, out)
     finally:
         shutil.rmtree(data_root, ignore_errors=True)
 

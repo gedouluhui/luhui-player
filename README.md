@@ -396,11 +396,12 @@ python packaging\verify_runtime.py
 
 1. `python -m compileall -q app packaging tests`——全树编译检查；
 2. `python tests\ci_leak_scan.py`——发布前防泄漏，个人绝对路径一处都不许进仓库；
-3. `python tests\ci_offline.py`——离线回归全套（23 份脚本、415 条判据，强制 offscreen、每份独立数据目录与限时）。
+3. `python tests\ci_offline.py`——离线回归全套（22 份脚本、359 条判据，强制 offscreen、每份独立数据目录与限时）。
 
 需要真实 mpv、真 ffmpeg、本地改前留底或生成产物的脚本（`test_engine.py`、`test_ui.py`、`test_thumbs.py`、
-`test_library.py`、`test_instance.py` 等）**不在 CI 里假装跑过**，留在本地按需执行；`pytest.ini` 用
-`unit` / `probe` 标记区分两类。均衡器在 CI 里自动带 `--no-kernel`，只跑不依赖内核的那一半。
+`test_library.py`、`test_instance.py`、`test_usage.py` 等）**不在 CI 里假装跑过**，留在本地按需执行；
+`pytest.ini` 用 `unit` / `probe` 标记区分两类。均衡器在 CI 里自动带 `--no-kernel`，只跑不依赖内核的那一半。
+`test_usage.py` 要 psutil 与 nvidia-smi，runner 没有 GPU，它的环境门禁会退 2，因此已归入本地探针。
 
 ---
 

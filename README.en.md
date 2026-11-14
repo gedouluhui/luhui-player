@@ -77,9 +77,10 @@ standalone. When swapping the engine, update the manifest and the version line i
 
 `.github/workflows/ci.yml` runs on `windows-latest`: `compileall` over the whole tree, a leak scan that
 forbids personal absolute paths (`tests/ci_leak_scan.py`), and the full offline suite
-(`tests/ci_offline.py` — 23 scripts / 415 checks, offscreen, isolated data dir, per-test timeout).
-Scripts that need a real mpv/ffmpeg, local before-change baselines or generated launchers stay local as
-probes; `pytest.ini` separates `unit` from `probe`. The equalizer runs its no-kernel half in CI.
+(`tests/ci_offline.py` — 22 scripts / 359 checks, offscreen, isolated data dir, per-test timeout).
+Scripts that need a real mpv/ffmpeg, local before-change baselines, generated launchers, psutil or
+nvidia-smi (`test_usage.py`) stay local as probes; `pytest.ini` separates `unit` from `probe`.
+The equalizer runs its no-kernel half in CI.
 
 ## Something is wrong? Run the doctor first
 
