@@ -44,7 +44,7 @@ from PyQt5.QtGui import (QColor, QCursor, QDropEvent, QFont, QFontMetrics, QIcon
                          QPixmap)  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QLabel, QLineEdit,
-                             QListWidgetItem, QPushButton, QScrollArea, QSlider, QShortcut,
+                             QPushButton, QScrollArea, QSlider, QShortcut,
                              QStackedWidget, QToolButton, QVBoxLayout, QWidget)  # noqa: E402
 
 from app import config as cfgmod  # noqa: E402
@@ -211,9 +211,14 @@ def has_picture(img: QImage) -> bool:
     三个条件各管一类冒牌货：纯色/全黑/全透明的标准差接近 0；深底白字（空浮层上的
     时间气泡、卡片占位块）有反差有颜色桶却没有彩度。门槛不是拍出来的——U18/U20 拿
     "彩色帧 vs 纯色空框"和"真封面 vs 占位块"两组已知答案把这条判据两头都夹住。
+
+    彩度按**面积比**而不是绝对像素数：Windows 上文字走 ClearType 亚像素抗锯齿，
+    占位块右下角那行灰色 "MP4" 会在笔画边缘留下几粒鲜艳到 max-min≥40 的彩边
+    （真机实测 4/1296，离屏平台则是 0）。只数"有几粒"的话，灰字占位块会被判成
+    有帧；要求彩色像素占到采样点的 1% 才能通过，真帧（同一样本 10%–100%）不受影响。
     """
     s = sample_stats(img)
-    return s["distinct"] >= 6 and s["std"] >= 4.0 and s["chroma"] >= 2
+    return s["distinct"] >= 6 and s["std"] >= 4.0 and s["chroma"] * 100 >= s["n"]
 
 
 # 系统电源状态（仅取"视频是否已断电"这一位用来解释为什么整屏是黑的）
@@ -706,7 +711,7 @@ def page_of(win, label: str):
 
 
 # ---------------------------------------------------------------- 媒体库判读
-def card_image(it) -> QImage:
+def card_image(icon: QIcon) -> QImage:
     """把卡片图标的位图取出来。
 
     为什么不能用"有没有图标"当判据：占位块和真封面都是**有色**的 QIcon，
@@ -714,15 +719,18 @@ def card_image(it) -> QImage:
     采样出来的颜色桶和标准差都趴在地上，真帧则两者都高。--falsify U20 就是拿
     真的 `_placeholder()` 产物来否掉这条判据的。
     """
-    ic = it.icon()
-    sizes = ic.availableSizes()
+    sizes = icon.availableSizes()
     sz = sizes[0] if sizes else QSize(LP.ICON_W, LP.ICON_H)
-    return ic.pixmap(sz).toImage()
+    return icon.pixmap(sz).toImage()
 
 
 def row_of(grid, suffix: str) -> int:
-    for i in range(grid.count()):
-        p = str(grid.item(i).data(Qt.UserRole) or "").replace("/", os.sep).lower()
+    """按文件名找行号。视图的真相在模型里，视图自己不再持有 item。"""
+    model = grid.model()
+    if model is None:
+        return -1
+    for i in range(model.rowCount()):
+        p = str(model.index(i, 0).data(Qt.UserRole) or "").replace("/", os.sep).lower()
         if p.endswith(suffix.lower()):
             return i
     return -1
@@ -730,8 +738,9 @@ def row_of(grid, suffix: str) -> int:
 
 def card_text(grid, suffix: str) -> str:
     """按文件名取卡片文字。行号取不到时返回空串——测试宁可判 FAIL 也不许自己崩。"""
+    model = grid.model()
     r = row_of(grid, suffix)
-    return "" if r < 0 else str(grid.item(r).text())
+    return "" if r < 0 or model is None else str(model.index(r, 0).data(Qt.DisplayRole) or "")
 
 
 def dblclick_row(grid, row: int) -> bool:
@@ -748,10 +757,10 @@ def dblclick_row(grid, row: int) -> bool:
     返回值取"信号有没有发出来"而不是"事件有没有送出去"：后者永远为真，
     等于没判。
     """
-    it = grid.item(row)
-    if it is None:
+    model = grid.model()
+    if model is None or not 0 <= row < model.rowCount():
         return False
-    r = grid.visualItemRect(it)
+    r = grid.visualRect(model.index(row, 0))
     if not r.isValid() or r.isEmpty():
         return False
     c = r.center()
@@ -793,10 +802,10 @@ def bare_dblclick(grid, row: int) -> bool:
     `QAbstractItemView::mouseDoubleClickEvent` 要求内部状态为 Pressing，
     所以裸发应当**不**触发——U22 判的就是这个方向。
     """
-    it = grid.item(row)
-    if it is None:
+    model = grid.model()
+    if model is None or not 0 <= row < model.rowCount():
         return False
-    r = grid.visualItemRect(it)
+    r = grid.visualRect(model.index(row, 0))
     if not r.isValid() or r.isEmpty():
         return False
     c, g = r.center(), grid.viewport().mapToGlobal(r.center())
@@ -3452,7 +3461,8 @@ def main() -> int:
           + f"目录现数=容器 {len(want)}／字幕 {len(subs)} 收到={sorted(os.path.basename(x) for x in got)} "
           f"缺={sorted(os.path.basename(x) for x in want - got)} "
           f"多={sorted(os.path.basename(x) for x in got - want)} 状态={win.library.last_status}")
-    rows = win.lib_panel.grid.count()
+    lib_model = win.lib_panel.grid.model()
+    rows = 0 if lib_model is None else lib_model.rowCount()
     check("卡片数与扫描结果一致且非空（空表时 0==0 那种「一致」不算通过）",
           cards_agree(rows, len(win.library.items())),
           f"卡片{rows} 条目{len(win.library.items())}")
@@ -3461,21 +3471,23 @@ def main() -> int:
         return next((x for x in win.library.items() if str(x.get("path")) == path), None)
 
     def posters_in():
-        for i in range(win.lib_panel.grid.count()):
-            it = win.lib_panel.grid.item(i)
-            e = entry_of(str(it.data(Qt.UserRole) or ""))
-            if e and float(e.get("dur") or 0) > 0 and not has_picture(card_image(it)):
+        for i in range(lib_model.rowCount()):
+            idx = lib_model.index(i, 0)
+            e = entry_of(str(idx.data(Qt.UserRole) or ""))
+            if e and float(e.get("dur") or 0) > 0 and not has_picture(
+                    card_image(idx.data(Qt.DecorationRole))):
                 return False
         return True
 
     got_posters = wait_for(posters_in, 90.0)
     lit, flat = [], []
     for i in range(rows):
-        it = win.lib_panel.grid.item(i)
-        e = entry_of(str(it.data(Qt.UserRole) or "")) or {}
-        nm = os.path.basename(str(it.data(Qt.UserRole) or ""))
-        s = sample_stats(card_image(it), 24, 12)
-        (lit if has_picture(card_image(it)) else flat).append(
+        idx = lib_model.index(i, 0)
+        e = entry_of(str(idx.data(Qt.UserRole) or "")) or {}
+        nm = os.path.basename(str(idx.data(Qt.UserRole) or ""))
+        icon = idx.data(Qt.DecorationRole)
+        s = sample_stats(card_image(icon), 24, 12)
+        (lit if has_picture(card_image(icon)) else flat).append(
             "%s(dur=%.1f 色%s 标准差%.0f)" % (nm, float(e.get("dur") or 0), s["distinct"], s["std"]))
     check("探到时长的片子，卡片上都是真抽出来的一帧（占位块不许冒充封面）",
           got_posters and len(flat) == 1 and flat[0].startswith("broken.mp4"),
@@ -5735,16 +5747,14 @@ def falsify() -> int:
     win2.preview.hide_preview()
 
     # U20 卡片"有帧/没帧"的判据必须能否决占位块，而且占位块自己得先能通过
-    #     setIcon 的类型关。真实踩过的一次是 _placeholder() 返回 QPixmap：
-    #     QListWidgetItem.setIcon() 只收 QIcon，TypeError 从 C++ 投递的信号槽里抛出来
-    #     没人接得住，进程直接 abort（rc=127、stderr 全空）。所以这里两头都判：
-    #     占位块判"无帧"（否掉"卡片有色就是有封面"）、真封面判"有帧"（否掉判据恒假）。
-    it_ph = QListWidgetItem("占位对照")
+    #     图标的类型关。真实踩过的一次是 _placeholder() 返回 QPixmap：模型换图标
+    #     只收 QIcon，TypeError 从 C++ 投递的信号槽里抛出来没人接得住，进程直接
+    #     abort（rc=127、stderr 全空）。所以这里两头都判：占位块判"无帧"（否掉
+    #     "卡片有色就是有封面"）、真封面判"有帧"（否掉判据恒假）。
     ph_icon = LP._placeholder({"ext": "mp4"})
     ph_is_qicon = isinstance(ph_icon, QIcon)
     if ph_is_qicon:
-        it_ph.setIcon(ph_icon)          # 类型不对的话这一步就会炸，正好让它炸在这里
-        ph_img = card_image(it_ph)
+        ph_img = card_image(ph_icon)
         ph_stats = sample_stats(ph_img, 24, 12)
         ph_pic = has_picture(ph_img)
     else:
@@ -5754,11 +5764,9 @@ def falsify() -> int:
     k1 = win2.posters.key_for(v1)
     got_real = wait_for(lambda: win2.posters.image(k1) is not None, 30.0)
     pm_real = win2.posters.image(k1)
-    it_real = QListWidgetItem("真封面对照")
-    it_real.setIcon(QIcon(pm_real) if pm_real is not None else QIcon())
-    real_img = card_image(it_real)
+    real_img = card_image(QIcon(pm_real) if pm_real is not None else QIcon())
     real_pic = has_picture(real_img)
-    falsified.append(("卡片封面判据两头都要成立：占位块判无帧且能进 setIcon，真帧判有帧",
+    falsified.append(("卡片封面判据两头都要成立：占位块是 QIcon 且判无帧，真帧判有帧",
                       ph_is_qicon and (not ph_pic) and (got_real and real_pic),
                       f"占位块是QIcon={ph_is_qicon} 判有帧={ph_pic}({ph_stats}) "
                       f"真帧取到={got_real} 判有帧={real_pic}({sample_stats(real_img, 24, 12)})"))
@@ -5788,7 +5796,7 @@ def falsify() -> int:
     bare = bare_dblclick(win2.lib_panel.grid, r_tgt)
     emitted: list[str] = []
     win2.lib_panel.sig_play_path.connect(emitted.append)
-    for sig in (win2.lib_panel.grid.itemDoubleClicked, win2.lib_panel.grid.itemActivated):
+    for sig in (win2.lib_panel.grid.doubleClicked, win2.lib_panel.grid.activated):
         try:
             sig.disconnect()
         except Exception:
@@ -5798,7 +5806,7 @@ def falsify() -> int:
     falsified.append(("双击的两条腿都得自己挣：裸发不触发、断链后不得再发播放请求",
                       (not bare) and clicked_broken and not emitted,
                       f"裸发触发={bare} 断链后信号发出={clicked_broken} "
-                      f"断链后仍请求播放={emitted} 行数={win2.lib_panel.grid.count()} "
+                      f"断链后仍请求播放={emitted} 行数={win2.lib_panel.grid.model().rowCount()} "
                       f"行号={r_tgt}"))
     win2.sidebar.setVisible(False)
     win2.video.refit()

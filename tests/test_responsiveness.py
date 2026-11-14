@@ -105,6 +105,22 @@ def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  —— {detail}" if detail else ""), flush=True)
 
 
+def view_rows(view) -> int:
+    """网格里的行数：QListView 的真相在模型里，不在视图自己身上。"""
+    model = view.model()
+    return 0 if model is None else model.rowCount()
+
+
+def row_value(view, row: int, role: int = Qt.UserRole):
+    model = view.model()
+    return None if model is None else model.index(int(row), 0).data(role)
+
+
+def card_icon(view, row: int) -> QIcon:
+    icon = row_value(view, row, Qt.DecorationRole)
+    return icon if isinstance(icon, QIcon) else QIcon()
+
+
 def pump(seconds: float, pred=None) -> bool:
     """跑事件循环，最多 `seconds`；`pred()` 真了就提前收。
 
@@ -325,7 +341,7 @@ def scen_watch_stat(fx: Fixture) -> dict:
         panel.set_items(fx.items)
     finally:
         cfgmod.Config._stamp = orig
-    out = {"env": "", "cards": panel.grid.count(), "want": len(fx.items),
+    out = {"env": "", "cards": view_rows(panel.grid), "want": len(fx.items),
            "stamps": calls[0]}
     panel.deleteLater()
     store.wait(300)
@@ -348,13 +364,14 @@ def scen_library_fill(fx: Fixture) -> dict:
     panel.set_items(fx.items)
     built = {"rebuilds": panel.rebuilds, "sync": panel.sync_decodes, "ph": panel.placeholders_made}
     drained = pump(25.0, lambda: not panel._fill_rows)
-    keys = [str(panel.grid.item(i).data(Qt.UserRole + 1) or "") for i in range(panel.grid.count())]
-    out = {"env": "", "rows": panel.grid.count(), "want": len(fx.items),
+    keys = [str(row_value(panel.grid, i, Qt.UserRole + 1) or "")
+            for i in range(view_rows(panel.grid))]
+    out = {"env": "", "rows": view_rows(panel.grid), "want": len(fx.items),
            "rebuilds": built["rebuilds"], "sync": built["sync"],
            "batches": panel.fill_batches, "ph": built["ph"],
            "no_key": sum(1 for k in keys if not k), "drained": drained,
-           "with_icon": sum(1 for i in range(panel.grid.count())
-                            if not panel.grid.item(i).icon().isNull())}
+           "with_icon": sum(1 for i in range(view_rows(panel.grid))
+                            if not card_icon(panel.grid, i).isNull())}
     store.wait(500)
     panel.deleteLater()
     return out
@@ -494,7 +511,7 @@ def scen_typing(fx: Fixture, panel=None, store=None) -> dict:
     want = [e for e in fx.items if word in str(e["name"]).lower()]
     out = {"env": "", "chars": len(words), "keystrokes": panel.keystrokes,
            "during": during, "fired": fired, "after": panel.rebuilds - before,
-           "shown": len(panel._shown), "rows": panel.grid.count(), "want": len(want)}
+           "shown": len(panel._shown), "rows": view_rows(panel.grid), "want": len(want)}
     store.wait(500)
     panel.deleteLater()
     return out
@@ -557,8 +574,9 @@ def scen_midrebuild(fx: Fixture) -> dict:
     fired = pump(3.0, lambda: len(panel._shown) == len(want_items))
     drained = pump(20.0, lambda: not panel._fill_rows)
     want = {store.key_for(e["path"]) for e in want_items}
-    got = {str(panel.grid.item(i).data(Qt.UserRole + 1) or "") for i in range(panel.grid.count())}
-    out = {"env": "", "rows": panel.grid.count(), "want": len(want), "want_rows": len(want_items),
+    got = {str(row_value(panel.grid, i, Qt.UserRole + 1) or "")
+           for i in range(view_rows(panel.grid))}
+    out = {"env": "", "rows": view_rows(panel.grid), "want": len(want), "want_rows": len(want_items),
            "fired": fired, "drained": drained, "foreign": len(got - want),
            "missing": len(want - got), "batches": panel.fill_batches}
     store.wait(500)
@@ -784,13 +802,12 @@ def scen_poster_scan(fx: Fixture) -> dict:
         return {"env": "写不出 jpg 样图（JPEG 插件没装？）"}
     panel.set_items(fx.items[:N_SCAN])
     drained = pump(20.0, lambda: not panel._fill_rows)
-    it = panel.grid.item(0)
-    key = str(it.data(Qt.UserRole + 1) or "") if it is not None else ""
+    key = str(row_value(panel.grid, 0, Qt.UserRole + 1) or "")
     s0 = panel.poster_scans
     panel._on_poster(key, True, "")
     scans = panel.poster_scans - s0
-    icon_ok = bool(it is not None and not it.icon().isNull())
-    rows = panel.grid.count()
+    icon_ok = bool(not card_icon(panel.grid, 0).isNull())
+    rows = view_rows(panel.grid)
     store.wait(500)
     panel.deleteLater()
     return {"env": "", "rows": rows, "key": bool(key), "drained": drained,
@@ -1197,16 +1214,16 @@ def falsify() -> int:
     cfgmod.Config._load_watch_state = orig_load
 
     # 1b) 重建时把整表丢掉、逐卡问 watch_state：stat 次数必须翻红
-    orig_label = LibraryPanel._label
+    orig_parts = LibraryPanel._parts
 
-    def label_per_card(self, e, watch=None):
-        return orig_label(self, e, None)          # 变异：无视整表快照，逐卡问
+    def parts_per_card(self, e, watch=None):
+        return orig_parts(self, e, None)          # 变异：无视整表快照，逐卡问
 
-    LibraryPanel._label = label_per_card
+    LibraryPanel._parts = parts_per_card
     ok1b, d1b = judge_watch_stat(scen_watch_stat(fx))
     f_case("进度表整趟只 stat 一次（拆回逐卡问 watch_state，'stat 1 次'必须翻红）",
            not ok1b, d1b)
-    LibraryPanel._label = orig_label
+    LibraryPanel._parts = orig_parts
 
     # 2) 记号调成常量（文件永远"没变过"）：外部改写与被删都必须翻红
     orig_stamp = cfgmod.Config.__dict__["_stamp"]
@@ -1241,15 +1258,14 @@ def falsify() -> int:
     def sync_decode(self, *_a):
         orig_rebuild(self, *_a)
         self.sync_decodes = 0
-        for r in range(self.grid.count()):
+        for r in range(self.grid.model().rowCount()):
             e = self._shown[r]
             key = self.posters.request(str(e.get("path") or ""), float(e.get("dur") or 0))
-            it = self.grid.item(r)
-            it.setData(Qt.UserRole + 1, key)
+            self.model.set_key(r, key)
             pm = self.posters.image(key)
             if pm is not None:
                 self.sync_decodes += 1
-                it.setIcon(QIcon(pm))
+                self.model.set_icon(r, QIcon(pm))
         self._fill_rows = []
     LibraryPanel._rebuild = sync_decode
     ok, d = judge_library_fill(scen_library_fill(fx))
@@ -1301,16 +1317,15 @@ def falsify() -> int:
     def one_batch(self):
         rows, self._fill_rows = list(self._fill_rows), []
         for r in rows:
-            it = self.grid.item(r)
-            if it is None or r >= len(self._shown):
+            if r >= len(self._shown):
                 continue
             e = self._shown[r]
             key = self.posters.request(str(e.get("path") or ""), float(e.get("dur") or 0))
-            it.setData(Qt.UserRole + 1, key)
+            self.model.set_key(r, key)
             pm = self.posters.image(key)
             if pm is not None:
                 self.sync_decodes += 1
-                it.setIcon(QIcon(pm))
+                self.model.set_icon(r, QIcon(pm))
         self.fill_batches += 1
     LibraryPanel._fill_batch = one_batch
     ok, d = judge_library_fill(scen_library_fill(fx))
@@ -1323,18 +1338,15 @@ def falsify() -> int:
         rows = self._fill_rows[:FILL_BATCH]
         del self._fill_rows[:FILL_BATCH]
         for r in rows:
-            it = self.grid.item(r)
-            if it is None:
-                continue
             e = self._items[r] if r < len(self._items) else None     # 变异：整库第 r 项
             if e is None:
                 continue
             key = self.posters.request(str(e.get("path") or ""), float(e.get("dur") or 0))
-            it.setData(Qt.UserRole + 1, key)
+            self.model.set_key(r, key)
             pm = self.posters.image(key)
             if pm is not None:
                 self.sync_decodes += 1
-                it.setIcon(QIcon(pm))
+                self.model.set_icon(r, QIcon(pm))
         self.fill_batches += 1
         if self._fill_rows:
             self._fill_timer.start()
@@ -1450,11 +1462,11 @@ def falsify() -> int:
         pm = self.posters.image(key)
         if pm is None:
             return
-        for i in range(self.grid.count()):
-            it = self.grid.item(i)
+        model = self.model
+        for i in range(model.rowCount()):
             self.poster_scans += 1
-            if it.data(Qt.UserRole + 1) == key:
-                it.setIcon(QIcon(pm))            # 变异：不 break，继续摸完整张表
+            if model.index(i, 0).data(Qt.UserRole + 1) == key:
+                model.set_icon(i, QIcon(pm))     # 变异：不 break，继续摸完整张表
     LibraryPanel._on_poster = scan_all
     ok, d = judge_poster_scan(scen_poster_scan(fx))
     f_case("封面回来命中就停（拆掉 break，'摸 1 张卡'必须翻红——大库成批回来时这就是几百万次白摸）",

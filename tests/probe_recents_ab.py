@@ -120,8 +120,9 @@ def recent_probe() -> dict:
     cfg.data["recent"] = [files[2], gone, outside, files[0], files[2].replace("/", "\\")]
     panel.btn_scope.setChecked(True)
     pump(0.1)
-    rows = [panel.grid.item(i).data(Qt.UserRole) for i in range(panel.grid.count())]
-    out = {"scope": panel.scope, "recent": rows, "n": panel.grid.count(),
+    model = panel.grid.model()
+    rows = [model.index(i, 0).data(Qt.UserRole) for i in range(model.rowCount())]
+    out = {"scope": panel.scope, "recent": rows, "n": model.rowCount(),
            "sort_enabled": panel.sort.isEnabled(),
            "placeholder": panel.search.placeholderText(),
            "status": panel.lbl_status.text(), "tip": panel.lbl_status.toolTip(),
@@ -134,7 +135,7 @@ def recent_probe() -> dict:
     panel.search.setText("")
     panel.btn_scope.setChecked(False)
     pump(0.4)
-    out["all_n"] = panel.grid.count()
+    out["all_n"] = panel.grid.model().rowCount()
     out["all_scope"] = panel.scope
     out["sort_enabled_back"] = panel.sort.isEnabled()
     panel.note_played(files[1])

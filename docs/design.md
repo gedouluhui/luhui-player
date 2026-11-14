@@ -422,7 +422,10 @@ app/ui/library_panel.py  媒体库：文件夹扫描、最近文件、封面缩�
                          150、单格封顶 260"算列数与格宽（300 侧栏一列 260、520 三列 160），
                          60ms 防抖后再套用，**视口宽变也要重排**（滚动条来去只改视口、不改面板宽）。
                          库里 0 部片与"搜索没命中"是两个不同的空状态页（各说各的下一步），
-                         底注「双击卡片播放」在无卡片时收起
+                         底注「双击卡片播放」在无卡片时收起。网格是 QListView + `LibraryModel`
+                         （QAbstractListModel）：每行只存文本与 QIcon 引用，uniformItemSizes +
+                         视口裁剪让 3000 项也只画可见的几十格；封面回来 `set_icon()` 发
+                         dataChanged(DecorationRole) 只重画那一格，不再整表清造
 app/ui/tweak_panel.py    调节页（侧栏第三页）：字幕样式/画面均衡/HDR/声音设备与 A-B
 app/ui/form_rows.py      侧栏共用的「标题 + 当前值 + 滑轨」一行（`NumRow`/`add_check`/`add_choice`）。
                          单独开一个文件而不是让两页各抄一份：QSlider 只有整数而表里是 float+step，
@@ -2395,14 +2398,32 @@ doctor 的崩溃记录按年龄分流、章节跳转（键位与菜单）、缩�
         `library-layout-300/520.png`、`library-empty-empty/nomatch.png` 已逐张看过
         （520 是三列、占位块带播放记号与扩展名、底注可见；两个空态标题/提示/按钮各不相同）。
 
-    (j) **这一轮的三档与停止规则**。**已测**＝上面九条各自的回执（全部是纯文件/离屏量具，
+    (j) **媒体库网格虚拟化：QListWidget → QListView + QAbstractListModel**。旧网格为每部片
+        建一个 `QListWidgetItem` 并挂一张 QPixmap：3000 部片＝3000 个控件级条目常驻内存，
+        重建/刷新都要逐条改控件，扫描回包时那一下是全表成本。现在 `LibraryModel` 每行只存
+        `(title, meta, alt, progress, path)` 五个字段加一个 QIcon 引用；视图用
+        `IconMode + Static + uniformItemSizes + 逐像素滚动`，只对**可见行**调 `paint()`，
+        大库滚动不再随总行数变贵。封面回来走 `set_icon(row, QIcon)` 发
+        `dataChanged(DecorationRole)`，只重画那一格；`_key_items`（key→row）保持 O(1)
+        定位，行为契约原样：220ms 搜索防抖、排序/范围、两个空态、12 张一片的占位与补图、
+        `sync_decodes=0`、原有计数器接口都不变。`tests/test_library_scale.py` 的 L6 是静态
+        AST 判据（不许再出现 QListWidget，必须有 QListView + QAbstractListModel + setModel），
+        L7 在 3000 项上查模型行数、路径集合、`_key_items` 的 int 行号与 `_on_poster` 的
+        O(1) + 图标落地。
+        读数：`probe_placeholder_cost.py`（3000 项，offscreen）`rebuild=15.5ms`、
+        `refresh(首趟)=7.5ms`、`refresh(缓存命中)=7.0ms`、`sync_decodes=0`（虚拟化前同机
+        `rebuild=45–58ms`）；3000 卡的 RSS 增量 +3.5MB（旧网格 +7.0MB）。
+        `probe_feel_perf.py` **20/20**：滚动每帧最差 34.9ms（含 8ms 事件等待，预算 50ms）、
+        跳到底首帧 14.3ms、悬停 mid=0.75 → done=1.00、淡出/再亮与换页纱全绿。
+
+    (k) **这一轮的三档与停止规则**。**已测**＝上面十条各自的回执（全部是纯文件/离屏量具，
         不弹前台、锁屏也能跑）；其中 (f) 真起了 runtime 内核，(e)(c) 的 argv/命令形状来自
         真产品代码，其余是离屏真渲染或纯函数逐格。**按设计推断**＝真机多屏拔插（(a) 的
         物理那一半）、真桌面上的悬停/窄窗鼠标路径（(g)）、真窗口里的帮助页字形（(h)）——
         这三格都要前台，用户明说在用电脑，所以**没有签字**。**没做**＝`tests/test_ui.py` 整套真窗口
         验收与 `capture_sweep --screen` 这轮没有跑；它们签的是"键与眼睛此刻归谁"，与本轮
         这些离线判据不重叠，不拿它们的旧账冒充本轮的绿。停止规则：不再重跑磨绿；用户不用
-        电脑时把上面九条原样复跑一遍即可，任何一条红先问判据是否坏了（三问：为何存在／前提
+        电脑时把上面十条原样复跑一遍即可，任何一条红先问判据是否坏了（三问：为何存在／前提
         还在吗／谁接班），不许为了变绿放宽阈值。换 mpv 构建或换样片时，复现入口分别是
         `tests/test_engine_async_real.py`、`tests/test_thumbs.py`、`tests/probe_library_layout.py`
         与 `tests/probe_placeholder_cost.py`，判据不动。

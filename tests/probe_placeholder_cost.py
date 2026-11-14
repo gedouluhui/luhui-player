@@ -72,7 +72,7 @@ t0 = time.perf_counter()
 panel._refresh_placeholders()
 t_refresh2 = (time.perf_counter() - t0) * 1000.0
 
-print(f"N={N}  items={panel.grid.count()}  "
+print(f"N={N}  items={panel.grid.model().rowCount()}  "
       f"rebuild={t_rebuild:.1f}ms  sync_decodes={panel.sync_decodes}  "
       f"placeholders_made={panel.placeholders_made}", flush=True)
 print(f"refresh(首趟，画图标)={t_refresh:.1f}ms  refresh(缓存命中)={t_refresh2:.1f}ms  "

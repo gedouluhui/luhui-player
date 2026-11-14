@@ -95,7 +95,8 @@ def main() -> int:
     TU.pump(0.6)
     grid = panel.grid
     bar = grid.verticalScrollBar()
-    check("3000 张卡片都进了模型", grid.count() == N_CARDS, f"count={grid.count()} build={build_ms:.0f}ms")
+    check("3000 张卡片都进了模型", grid.model().rowCount() == N_CARDS,
+          f"count={grid.model().rowCount()} build={build_ms:.0f}ms")
     check("网格有滚动量程", bar.maximum() > bar.minimum() + 2000,
           f"range={bar.minimum()}..{bar.maximum()}")
     check("大库仍开着滚动手感", panel.scroll_feel is not None)
@@ -171,7 +172,10 @@ def main() -> int:
     rect = grid.visualRect(idx)
     check("首屏有卡片可悬停", rect.isValid() and rect.width() > 20, f"rect={rect}")
     send_mouse(grid.viewport(), QEvent.MouseMove, rect.center())
-    TU.pump(0.016)
+    # 悬停推进按 16ms 的 tick 走：采样窗必须**包住**至少一个 tick。取 16ms 时
+    # 窗口和第一拍同刻收尾，回合稍有抖动就采到第 0 帧（真机实测 mid=0.00，
+    # 但 0.3s 后 done=1.00——动画没坏，是采样早了一拍）。
+    TU.pump(0.05)
     mid = hv.progress(0) if hv is not None else 0.0
     TU.pump(0.3)
     done = hv.progress(0) if hv is not None else 0.0

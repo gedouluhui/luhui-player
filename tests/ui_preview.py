@@ -113,12 +113,12 @@ def _fill_library(win: MainWindow) -> None:
     win.lib_panel.set_items(items)
     win.lib_panel._fill_timer.stop()
     win.lib_panel._fill_rows.clear()
+    model = win.lib_panel.grid.model()
     for i, e in enumerate(items):
-        it = win.lib_panel.grid.item(i)
-        if it is not None:
+        if 0 <= i < model.rowCount():
             pm = _poster(320, 180, i, os.path.splitext(e["name"])[0])
-            it.setIcon(QIcon(pm))
-            it.setData(Qt.UserRole + 1, "preview")
+            model.set_icon(i, QIcon(pm))
+            model.set_key(i, "preview")
     # 真机是停手 60ms 后才排卡片；预览没有等待窗，手动让这一趟落定。
     win.lib_panel._layout_timer.stop()
     win.lib_panel._apply_card_layout()

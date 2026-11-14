@@ -335,6 +335,8 @@ python -m app.doctor --falsify   :: 开发者用：喂已知坏数据，每条�
 所以别把它当成已有功能（`docs\design.md` §6 第 37(d) 记了这条实测与那句说错了的话）。
 库大到几百上千项时窗口照常回话：搜索框打字不在途中重扫整库（合并输入后再画），封面先铺占位块、
 再一张一片地补上（不在重建那一趟里逐张解码），往里拖一个文件夹也不会把播放列表反复清造。
+网格走模型/视图虚拟化：3000 部片也只画视口里的那几十张，封面回来只重画对应一格——重建在
+16ms 量级，大库下的滚动每帧仍在 50ms 预算内。
 
 **界面**：无边框窗口（保留原生阴影、圆角、贴边快照）、侧栏六页（播放列表/媒体库/调节/画面/声音均衡/统计）、
 全屏、浮动控制条与 OSD 气泡、主题色可选（设置页改完立即生效）。
@@ -396,7 +398,7 @@ python packaging\verify_runtime.py
 
 1. `python -m compileall -q app packaging tests`——全树编译检查；
 2. `python tests\ci_leak_scan.py`——发布前防泄漏，个人绝对路径一处都不许进仓库；
-3. `python tests\ci_offline.py`——离线回归全套（22 份脚本、359 条判据，强制 offscreen、每份独立数据目录与限时）。
+3. `python tests\ci_offline.py`——离线回归全套（22 份脚本、361 条判据，强制 offscreen、每份独立数据目录与限时）。
 
 需要真实 mpv、真 ffmpeg、本地改前留底或生成产物的脚本（`test_engine.py`、`test_ui.py`、`test_thumbs.py`、
 `test_library.py`、`test_instance.py`、`test_usage.py` 等）**不在 CI 里假装跑过**，留在本地按需执行；

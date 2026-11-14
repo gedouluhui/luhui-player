@@ -11,12 +11,13 @@ from __future__ import annotations
 import os
 import re
 
-from PyQt5.QtCore import QEvent, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt5.QtCore import (QAbstractListModel, QEvent, QModelIndex, QRectF, QSize,
+                          Qt, QTimer, QUrl, pyqtSignal)
 from PyQt5.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QListWidget,
-                             QListWidgetItem, QMenu, QPushButton, QStyle,
-                             QStyledItemDelegate, QToolButton, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QListView, QMenu,
+                             QPushButton, QStyle, QStyledItemDelegate, QToolButton,
+                             QVBoxLayout, QWidget)
 
 from ..engine.library import Library
 from ..engine.posters import PosterStore
@@ -183,6 +184,77 @@ class _CardDelegate(QStyledItemDelegate):
                    Qt.AlignVCenter | Qt.AlignLeft, mm)
         p.restore()
 
+class LibraryModel(QAbstractListModel):
+    """媒体库整表：行数据只存在模型里，视图按需问可见行（真虚拟化）。
+
+    以前一行一个 `QListWidgetItem`：3000 项的库＝3000 个 C++ 对象＋3000 次 addItem，
+    扫描回包那一下整窗都要等它们造完。现在重建只是换掉三条 Python 列表，
+    排布与绘制只发生在屏幕看得见的那几十行上。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cells: list[tuple] = []       # (标题, 元信息, 两档短元信息, 进度, 路径)
+        self._icons: list[QIcon] = []
+        self._keys: list[str] = []
+
+    def rowCount(self, parent=QModelIndex()):        # noqa: N802 — Qt 命名
+        return 0 if parent.isValid() else len(self._cells)
+
+    def data(self, idx, role=Qt.DisplayRole):
+        r = idx.row()
+        if not idx.isValid() or not 0 <= r < len(self._cells):
+            return None
+        title, meta, alt, frac, path = self._cells[r]
+        if role == Qt.DisplayRole:
+            return f"{title}\n{meta}"
+        if role == Qt.DecorationRole:
+            return self._icons[r]
+        if role == ROLE_TITLE:
+            return title
+        if role == ROLE_META:
+            return meta
+        if role == ROLE_META_ALT:
+            return alt
+        if role == ROLE_PROGRESS:
+            return frac
+        if role == Qt.UserRole:
+            return path
+        if role == Qt.UserRole + 1:
+            return self._keys[r]
+        if role == Qt.ToolTipRole:
+            return path
+        return None
+
+    def reset_rows(self, cells: list[tuple], icons: list[QIcon]) -> None:
+        self.beginResetModel()
+        self._cells = cells
+        self._icons = icons
+        self._keys = [""] * len(cells)
+        self.endResetModel()
+
+    def set_key(self, row: int, key: str) -> None:
+        if 0 <= row < len(self._keys):
+            self._keys[row] = key
+
+    def set_icon(self, row: int, icon: QIcon) -> None:
+        if not 0 <= row < len(self._icons):
+            return
+        self._icons[row] = icon
+        idx = self.index(row, 0)
+        self.dataChanged.emit(idx, idx, [Qt.DecorationRole])
+
+    def refresh_placeholders(self, icon_for) -> None:
+        """卡片档位变了：只换还没拿到封面的行，一次 dataChanged 收口。"""
+        if not self._icons:
+            return
+        for r in range(len(self._icons)):
+            if not self._keys[r]:
+                self._icons[r] = icon_for(r)
+        self.dataChanged.emit(self.index(0, 0), self.index(len(self._icons) - 1, 0),
+                              [Qt.DecorationRole])
+
+
 # 封面补图的分批大小：一片 = 事件循环每空闲一次最多解码几张封面。
 # 为什么不整表一次解完：本机实测一张 320×180 的封面 jpg 解码约 1.0ms，而 PosterStore
 # 的内存缓存只留最近 60 张（那是刻意的，不让大库吃内存），于是"重建 3000 项的库"=
@@ -236,9 +308,9 @@ class LibraryPanel(QWidget):
         self.fill_batches = 0        # 补图分了几个空闲片跑完
         self.placeholders_made = 0   # 占位块画了几次（同扩展名×尺寸档只该画一次）
         self.poster_scans = 0        # _on_poster 为找到那一行摸过几张卡（命中就该停）
-        # 封面键 → 卡片行：封面按 key 回来，线性扫 grid 是 O(行数)；库里 3000 项成批
-        # 回图时这就是几百万次 item()。字典在重建时清空、补图时登记，命中即 O(1)。
-        self._key_items: dict[str, QListWidgetItem] = {}
+        # 封面键 → 行号：封面按 key 回来，线性扫表是 O(行数)；库里 3000 项成批
+        # 回图时这就是几百万次无用调用。字典在重建时清空、补图时登记，命中即 O(1)。
+        self._key_items: dict[str, int] = {}
         self.card_layouts = 0        # 真正改过几次卡片尺寸（同尺寸的 resize 不该抖）
         self.card_w = GRID_W         # 当前格宽/列数（判据与预览读它们）
         self.card_cols = 1
@@ -310,26 +382,28 @@ class LibraryPanel(QWidget):
         self.lbl_status = _label("未扫描", self, "AppTitle")
         row.addWidget(self.lbl_status)
 
-        self.grid = QListWidget(self)
+        self.model = LibraryModel(self)
+        self.grid = QListView(self)
         self.grid.setObjectName("LibraryGrid")
-        self.grid.setViewMode(QListWidget.IconMode)
-        self.grid.setResizeMode(QListWidget.Adjust)
-        self.grid.setMovement(QListWidget.Static)
+        self.grid.setViewMode(QListView.IconMode)
+        self.grid.setResizeMode(QListView.Adjust)
+        self.grid.setMovement(QListView.Static)
         self.grid.setItemDelegate(_CardDelegate(self.grid))
+        self.grid.setModel(self.model)
         self.grid.setMouseTracking(True)
-        self.grid.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        self.grid.setVerticalScrollMode(QListView.ScrollPerPixel)
         self.grid.setIconSize(QSize(ICON_W, ICON_H))
         self.grid.setGridSize(QSize(GRID_W, GRID_H))
         self.grid.setSpacing(4)
         self.grid.setWordWrap(True)
         self.grid.setTextElideMode(Qt.ElideRight)
-        self.grid.setSelectionMode(QListWidget.SingleSelection)
+        self.grid.setSelectionMode(QListView.SingleSelection)
         self.grid.setUniformItemSizes(True)
         self.grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
         self.grid.customContextMenuRequested.connect(self._context_menu)
-        self.grid.itemDoubleClicked.connect(lambda it: self._play(it))
-        self.grid.itemActivated.connect(lambda it: self._play(it))
+        self.grid.doubleClicked.connect(self._play)
+        self.grid.activated.connect(self._play)
         root.addWidget(self.grid, 1)
         # 视口本身也要盯着：滚动条出现/消失时视口宽会变（487↔498），而面板组件本身的
         # 宽度没变，resizeEvent 不会来。只听面板宽度就会一直按"带滚动条"的窄口径排卡片。
@@ -689,32 +763,23 @@ class LibraryPanel(QWidget):
                 self.last_error = f"排序失败：{type(exc).__name__}: {exc}"
         self._shown = items
 
-        self.grid.blockSignals(True)
-        self.grid.clear()
-        self._key_items.clear()                 # 旧表的行随 grid.clear() 作废，定位表同步清
+        self._key_items.clear()                 # 旧表随模型重置作废，定位表同步清
         self.sync_decodes = 0                   # 只统计"重建这一趟里同步解码了几张"
         # 一次 stat 换整张进度表：逐卡调 cfg.watch_state 会为"外部有没有改过"各 stat 一次，
         # 240 张就是 240 次。同一趟重建里这份表不会变（同线程，重建期间没有写入口）。
         watch = self.cfg.watch_snapshot()
+        cells: list[tuple] = []
+        icons: list[QIcon] = []
         for e in items:
             path = str(e.get("path") or "")
             title, meta, frac, alt = self._parts(e, watch)
-            it = QListWidgetItem(f"{title}\n{meta}")
-            it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            it.setData(Qt.UserRole, path)
-            it.setData(ROLE_TITLE, title)
-            it.setData(ROLE_META, meta)
-            it.setData(ROLE_META_ALT, alt)
-            it.setData(ROLE_PROGRESS, frac)
-            it.setToolTip(path)
-            # key 先留空：封面是"补"出来的，不是"建"出来的。`_on_poster` 按这个键认卡片，
-            # 补图那片填上之后，ffmpeg 回来的那一张才有地方换图标。
-            it.setData(Qt.UserRole + 1, "")
-            it.setIcon(self._placeholder_icon(e))
-            self.grid.addItem(it)
-        self.grid.blockSignals(False)
+            cells.append((title, meta, alt, frac, path))
+            icons.append(self._placeholder_icon(e))
+        # 键先留空：封面是"补"出来的，不是"建"出来的。`_on_poster` 按这个键认行，
+        # 补图那片填上之后，ffmpeg 回来的那一张才有地方换图标。
+        self.model.reset_rows(cells, icons)
         # 上一代的余量就此作废：`_fill_rows` 整个换成新表的行号，正在排队的 timeout
-        # 只会照着**新**的行号补，不会把旧列表的图标画到新列表上。
+        # 只会照着**新**的行号补，不会把旧表的图标画到新表上。
         self._fill_rows = list(range(len(items)))
         self._fill_gen += 1
         self.rebuilds += 1
@@ -732,19 +797,18 @@ class LibraryPanel(QWidget):
         rows = self._fill_rows[:FILL_BATCH]
         del self._fill_rows[:FILL_BATCH]
         for r in rows:
-            it = self.grid.item(r)
-            if it is None or r >= len(self._shown):    # 表比队列短＝中途重建过，这一片作废
+            if r >= len(self._shown):           # 表比队列短＝中途重建过，这一片作废
                 continue
             e = self._shown[r]
             path = str(e.get("path") or "")
             key = self.posters.request(path, float(e.get("dur") or 0))
-            it.setData(Qt.UserRole + 1, key)
+            self.model.set_key(r, key)
             if key:
-                self._key_items[key] = it       # 封面回来时按这个键直查，不扫全表
+                self._key_items[key] = r        # 封面回来时按这个键直查，不扫全表
             pm = self.posters.image(key)
             if pm is not None:
                 self.sync_decodes += 1
-                it.setIcon(QIcon(pm))
+                self.model.set_icon(r, QIcon(pm))
         self.fill_batches += 1
         if self._fill_rows:
             self._fill_timer.start()
@@ -776,12 +840,8 @@ class LibraryPanel(QWidget):
         为什么不是等下一次整表重建：换列/换格只在拖侧栏时发生，而用户拖完就要看见
         新排布；等下次扫描回包可能已经过了很久，中间一直挂着上一档尺寸的糊图。
         """
-        for i in range(self.grid.count()):
-            it = self.grid.item(i)
-            if it is None or it.data(Qt.UserRole + 1):
-                continue                    # 封面已就绪（或正在补）：这一格不归占位块管
-            if i < len(self._shown):
-                it.setIcon(self._placeholder_icon(self._shown[i]))
+        self.model.refresh_placeholders(
+            lambda r: self._placeholder_icon(self._shown[r]))
 
     def _keyf(self) -> str:
         i = self.sort.currentIndex()
@@ -824,40 +884,38 @@ class LibraryPanel(QWidget):
                     (f"{dur_text} · 已看完", f"{dur_text} · 已看完"))
         return stem, base, 0.0, (base, base)
 
-    def _label(self, e: dict, watch: dict | None = None) -> str:
-        title, meta, _frac, _alt = self._parts(e, watch)
-        return f"{title}\n{meta}"
-
     def _on_poster(self, key: str, ok: bool, _detail: str) -> None:
         """封面回来了：只换那一张的图标，不重建整表（重建会把用户的选中态弄丢）。
 
         `_key_items` 直查：一张封面只属于一行（key 由路径+大小+修改时间算出来），
-        旧写法逐行摸 `grid.item()` 是 O(行数)，库里 3000 项、封面成批回来时这一笔
-        就是几百万次无用调用（2026-10-20 审查 B5；`poster_scans` 是给判据读的读数，
-        命中一张仍记 1）。
+        旧写法逐行摸表是 O(行数)，库里 3000 项、封面成批回来时这一笔就是几百万次
+        无用调用（2026-10-20 审查 B5；`poster_scans` 是给判据读的读数，命中一张仍记 1）。
         """
         if not ok:
             return
-        it = self._key_items.get(key)
-        if it is None:
+        row = self._key_items.get(key)
+        if row is None:
             return
         pm = self.posters.image(key)
         if pm is None:
             return
         self.poster_scans += 1
-        it.setIcon(QIcon(pm))
+        self.model.set_icon(row, QIcon(pm))
 
     # ---------- 动作 ----------
-    def _play(self, it: QListWidgetItem | None) -> None:
-        path = str(it.data(Qt.UserRole) or "") if it is not None else ""
-        if path:
-            self.sig_play_path.emit(path)
+    def _play(self, idx) -> None:
+        row = idx.row() if idx is not None and idx.isValid() else -1
+        if 0 <= row < len(self._shown):
+            path = str(self._shown[row].get("path") or "")
+            if path:
+                self.sig_play_path.emit(path)
 
     def _context_menu(self, pos) -> None:
-        it = self.grid.itemAt(pos)
-        if it is None:
+        idx = self.grid.indexAt(pos)
+        if not idx.isValid():
             return
-        path = str(it.data(Qt.UserRole) or "")
+        row = idx.row()
+        path = str(self._shown[row].get("path") or "") if 0 <= row < len(self._shown) else ""
         m = QMenu(self)
         a_play = m.addAction("播放")
         a_all = m.addAction("从这项开始播放全部")
@@ -866,11 +924,10 @@ class LibraryPanel(QWidget):
         a_forget = m.addAction("从媒体库移除")
         chosen = m.exec(self.grid.mapToGlobal(pos))
         if chosen is a_play:
-            self._play(it)
+            self._play(idx)
         elif chosen is a_all:
-            i = self.grid.row(it)
-            paths = [str(self.grid.item(j).data(Qt.UserRole) or "") for j in range(i, self.grid.count())]
-            paths += [str(self.grid.item(j).data(Qt.UserRole) or "") for j in range(0, i)]
+            paths = [str(e.get("path") or "") for e in self._shown[row:]]
+            paths += [str(e.get("path") or "") for e in self._shown[:row]]
             self.sig_play_list.emit([p for p in paths if p])
         elif chosen is a_dir and path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
@@ -908,9 +965,9 @@ def _placeholder(e: dict, w: int = ICON_W, h: int = ICON_H, dpr: float = 1.0) ->
       · 按 devicePixelRatio 出图：本机 200% 缩放，1x 位图会被拉成双倍糊边。
     播放记号只占高度的 ~34%，缩到 141×79 也不挤；没有高光、没有渐变，是哑面。
 
-    返回 QIcon 不是 QPixmap：`QListWidgetItem.setIcon()` 只收 QIcon，
-    给它 QPixmap 会在**信号槽回调里**抛 TypeError —— 而这个回调是 C++ 侧的事件投递调进来的，
-    异常穿不过去，进程直接 abort（rc=127、一行 traceback 都留不下）。
+    返回 QIcon 不是 QPixmap：模型换图标只收 QIcon，给它 QPixmap 会在**信号槽回调里**
+    抛 TypeError —— 而这个回调是 C++ 侧的事件投递调进来的，异常穿不过去，
+    进程直接 abort（rc=127、一行 traceback 都留不下）。
     类型收口在函数签名上，比在每个调用点记得包一层可靠。
     """
     w, h = max(1, int(w)), max(1, int(h))

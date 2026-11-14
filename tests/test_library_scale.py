@@ -7,9 +7,12 @@
   L2 探测并发跑（≤ min(4, cpu)）：12 个文件不该串成一条 12 行的队；
   L3 大目录先把骨架列表交出去（每张卡先显示 "--:--"），时长随后补齐；
   L4 `poolkit` 同一作业可以有多个在途孩子（并发探测的前提），kill_children 一个不漏；
-  L5 封面回来按 `_key_items` 字典直查（结构闸门：不再线性扫 grid）。
+  L5 封面回来按 `_key_items` 字典直查（结构闸门：不再线性扫 grid）；
+  L6 网格是真虚拟化的 `QListView + QAbstractListModel`，不再逐行造 QListWidgetItem；
+  L7 三千行只存在模型里，封面回来只改命中的那一行（不重建）。
 
-L1–L4 用假探测函数（不依赖 ffmpeg 内容），只量调度与键；L5 是源码结构判据。
+L1–L4 用假探测函数（不依赖 ffmpeg 内容），只量调度与键；L5/L6 是源码结构判据；
+L7 造 3000 行真面板，量模型契约与海报直改。
 """
 from __future__ import annotations
 
@@ -28,10 +31,14 @@ DATA = tempfile.mkdtemp(prefix="lib-scale-", dir=HERE)
 os.environ["LUHUI_DATA"] = DATA
 sys.path.insert(0, ROOT)
 
-from PyQt5.QtWidgets import QApplication  # noqa: E402
+from PyQt5.QtCore import QObject, Qt, pyqtSignal  # noqa: E402
+from PyQt5.QtGui import QColor, QIcon, QPixmap  # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QListView,  # noqa: E402
+                             QListWidget)
 
 from app.engine import library as LB  # noqa: E402
 from app.engine import poolkit  # noqa: E402
+from app.ui.library_panel import LibraryPanel  # noqa: E402
 
 app = QApplication.instance() or QApplication([])
 
@@ -189,12 +196,112 @@ def l5_poster_dict() -> tuple[bool, str]:
     return False, "library_panel 里找不到 _on_poster"
 
 
+def l6_model_view() -> tuple[bool, str]:
+    """结构闸门：视图换成 QListView + QAbstractListModel，行不再是 QListWidgetItem。"""
+    path = os.path.join(ROOT, "app", "ui", "library_panel.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    legacy = sorted(n for n in ("QListWidget", "QListWidgetItem") if n in names)
+    if legacy:
+        return False, f"library_panel 仍在用 {legacy}（没有真虚拟化）"
+    if "QListView" not in names or "QAbstractListModel" not in names:
+        return False, "library_panel 没有 QListView + QAbstractListModel"
+    if "setModel" not in attrs:
+        return False, "视图没有接上模型（找不到 setModel）"
+    return True, ""
+
+
+class _CfgStub:
+    def watch_snapshot(self) -> dict:
+        return {}
+
+
+class _PosterStub(QObject):
+    """可控封面源：补图阶段不返回图（只发键），`allow` 打开后才"回来"一张。"""
+
+    sig_done = pyqtSignal(str, bool, str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.allow = False
+        self.asked: set[str] = set()
+        self._pm = QPixmap(24, 14)
+        self._pm.fill(QColor("#3a7bd5"))
+
+    def request(self, path: str, dur: float) -> str:
+        key = "k:" + str(path)
+        self.asked.add(key)
+        return key
+
+    def image(self, key: str):
+        return self._pm if self.allow and key in self.asked else None
+
+    def wait(self, ms: int = 0) -> bool:
+        return True
+
+
+def l7_model_rows() -> tuple[bool, str]:
+    """3000 行只存在模型里；`_key_items` 存行号；封面回来只改那一行、不重建。"""
+    n = 3000
+    lib = LB.Library(os.path.join(DATA, "no-ffmpeg.exe"),
+                     os.path.join(DATA, "view-index.json"), [])
+    store = _PosterStub()
+    panel = LibraryPanel(lib, store, _CfgStub())
+    panel.setAttribute(Qt.WA_DontShowOnScreen, True)
+    panel.resize(520, 900)
+    items = [{"name": f"clip-{i:04d}.mp4", "path": f"X:\\lib\\clip-{i:04d}.mp4",
+              "ext": ".mp4", "dur": 60.0 + i, "size": 1024 * (i + 1),
+              "mtime": float(i)} for i in range(n)]
+    try:
+        panel.set_items(items)
+        if not isinstance(panel.grid, QListView) or isinstance(panel.grid, QListWidget):
+            return False, f"grid 还是 {type(panel.grid).__name__}"
+        model = panel.grid.model()
+        if model is None or model.rowCount() != n:
+            return False, f"模型行数不对：{None if model is None else model.rowCount()}"
+        got = {str(model.index(i, 0).data(Qt.UserRole) or "") for i in range(n)}
+        if got != {e["path"] for e in items}:
+            return False, f"模型里的路径集合对不上（{len(got)}/{n}，默认排序后仍应是同一张表）"
+        if not str(model.index(n - 1, 0).data(Qt.UserRole) or ""):
+            return False, "第 3000 行取不到数据（模型没有持有整表）"
+        while panel._fill_rows:
+            before = len(panel._fill_rows)
+            panel._fill_batch()
+            if len(panel._fill_rows) >= before:
+                return False, "补图队列没有前进"
+        panel._fill_timer.stop()
+        if len(panel._key_items) != n:
+            return False, f"补图后键表只有 {len(panel._key_items)}/{n}"
+        key, row = next(iter(panel._key_items.items()))
+        if not isinstance(row, int) or not 0 <= row < n:
+            return False, f"_key_items 的值不是行号：{type(row).__name__}"
+        if str(model.index(row, 0).data(Qt.UserRole + 1) or "") != key:
+            return False, "那一行的键和 _key_items 对不上"
+        store.allow = True
+        r0, s0 = panel.rebuilds, panel.poster_scans
+        panel._on_poster(key, True, "")
+        if panel.rebuilds != r0:
+            return False, "封面回来触发了整表重建"
+        if panel.poster_scans - s0 != 1:
+            return False, f"封面回来摸了 {panel.poster_scans - s0} 张卡（要 1）"
+        icon = model.index(row, 0).data(Qt.DecorationRole)
+        if not isinstance(icon, QIcon) or icon.isNull():
+            return False, "命中的那一行图标没换成真封面"
+        return True, f"{n} 行在模型里；封面只改第 {row} 行，重建 0 次"
+    finally:
+        panel.close()
+        panel.deleteLater()
+
+
 def main() -> int:
     rows = [("L1 索引键规范化（大小写/写法都命中缓存）", l1_normalized_keys),
             ("L2 探测并发（≤ min(4, cpu)）", l2_concurrent_probe),
             ("L3 大目录先发骨架再补齐时长", l3_skeleton_first),
             ("L4 同一作业多个在途孩子全部登记/杀掉", l4_multi_children),
-            ("L5 封面按 _key_items 字典直查", l5_poster_dict)]
+            ("L5 封面按 _key_items 字典直查", l5_poster_dict),
+            ("L6 网格是 QListView + 模型（不再逐行造 item）", l6_model_view),
+            ("L7 三千行在模型里，封面只改命中行", l7_model_rows)]
     red = 0
     for name, fn in rows:
         try:
