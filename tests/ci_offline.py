@@ -49,6 +49,7 @@ SUITE = [
     "test_keymap.py",           # 快捷键表
     "test_keymap_dialog.py",    # 快捷键编辑对话框
     "test_open_receipt.py",     # “已载入 N 个文件”回执
+    "test_openwith_register.py",# 「打开方式」自登记（HKCU 临时子树，不碰默认程序）
     "test_round25.py",          # R25 四轴离线判据
     "test_subtitle_drop.py",    # 字幕拖入路由
     "test_ui_polish.py",        # 窄窗控制条与按钮态（offscreen）

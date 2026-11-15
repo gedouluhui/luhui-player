@@ -24,6 +24,9 @@ No Electron, no web view, no network, no DRM, no telemetry.
   PassThrough; the embedded mpv child window is re-fitted on `WM_DPICHANGED`).
 - **A timeline that shows the film.** Hovering shows real frame thumbnails with a time bubble; chapter
   markers, buffered range and A-B loop are visible.
+- **The window stays on screen.** First launch is centred with the whole window (title bar included)
+  inside the usable area; later launches restore your position and size, and an off-screen window is
+  pulled back so the title bar is always grabbable. Fullscreen and resizing remain your choice.
 - **Portable by construction.** onedir packaging: copy the folder, it runs. Config, cache, screenshots live
   inside that folder.
 
@@ -77,7 +80,7 @@ standalone. When swapping the engine, update the manifest and the version line i
 
 `.github/workflows/ci.yml` runs on `windows-latest`: `compileall` over the whole tree, a leak scan that
 forbids personal absolute paths (`tests/ci_leak_scan.py`), and the full offline suite
-(`tests/ci_offline.py` — 22 scripts / 361 checks, offscreen, isolated data dir, per-test timeout).
+(`tests/ci_offline.py` — 23 scripts / 377 checks, offscreen, isolated data dir, per-test timeout).
 Scripts that need a real mpv/ffmpeg, local before-change baselines, generated launchers, psutil or
 nvidia-smi (`test_usage.py`) stay local as probes; `pytest.ini` separates `unit` from `probe`.
 The equalizer runs its no-kernel half in CI.

@@ -31,6 +31,7 @@ from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from . import config as cfgmod
+from . import openwith
 from . import win32
 from .engine import poolkit
 from .ui import theme
@@ -645,6 +646,10 @@ def startup_checks() -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     install_crash_log()          # 第一件事：后面任何一步炸了都得留下证据
     argv = list(sys.argv[1:] if argv is None else argv)
+    # 登记开关必须在 collect_paths 与 QApplication 之前：它们不是文件参数，也不该拉起界面。
+    ow = openwith.cli(argv)
+    if ow is not None:
+        return ow
     kept, dropped, ignored = collect_paths(argv)
 
     _enable_high_dpi()
@@ -684,6 +689,9 @@ def main(argv: list[str] | None = None) -> int:
     app.setProperty("main_window", win)
     handoff.attach(win)
     win.show()
+    # 收口由窗口自己的 60ms 兜底计时器做：show 返回时 Qt 的显示序列还没走完，这时
+    # 同步再 setGeometry 会被它随后的一次布局覆盖，还会消费掉收口目标（真机实测
+    # 窗口反而被撑到超出屏幕）。见 MainWindow.showEvent / settle_start_geometry。
     if cfgmod.FROZEN:
         # 打包版没有控制台：这一行同时充当"窗口真的建出来了"与资源落点的现场记录。
         print(f"[startup] ready root={cfgmod.ROOT} bundle={cfgmod.BUNDLE_DIR} "

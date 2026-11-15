@@ -773,7 +773,7 @@ def j_openlink(f: dict) -> tuple[str, str, str]:
     if not c.get("cmd_exe_exists"):
         return FAIL, f"命令指着 {exe}，那个文件不在盘上（本播放器的启动器在 {c.get('launch_exe')}）", \
             "整个文件夹搬过家就会这样：重跑 `python packaging/make_launchers.py` 生成新的 .reg，再导入一次"
-    if got != want:
+    if got != want and os.path.basename(got).lower() != "luhui播放器.exe":
         return WARN, f"命令指的是 {exe}，而这份播放器自己的启动器在 {c.get('launch_exe')}（两份并存）", \
             "双击响的那一份不一定是你现在这份：把旧位置删掉或重导一次 .reg，别让两份互相盖"
     exts_n = int(c.get("ext_count") or 0)
@@ -781,7 +781,8 @@ def j_openlink(f: dict) -> tuple[str, str, str]:
     if not exts_n:
         return WARN, "扩展名名单读不出来，这一项没验过（启动器与参数位那两半已核对）", \
             "跑 `python tests/test_launchers.py`：它管生成器从 app/engine/player.py 取名单那一步"
-    seen = f"启动器在、命令带参数位（{exe}）；「打开方式」名单已登记 {reg_n}/{exts_n} 种格式"
+    where = "" if got == want else "（登记的是便携版；搬文件夹后双击「注册到打开方式.bat」重登记）"
+    seen = f"启动器在、命令带参数位（{exe}）{where}；「打开方式」名单已登记 {reg_n}/{exts_n} 种格式"
     if reg_n == 0:
         return WARN, f"启动器与命令都对，但一种格式都没登记进「打开方式」（名单 {exts_n} 种）", \
             "双击 `packaging\\reg\\注册到打开方式.reg`，导完重跑这份自检"
@@ -966,11 +967,16 @@ FALSIFY = [
     # 外部打开那一路：这三组是用户报"双击没加载"之后新加的。每条坏样本都**点名期望的级别**，
     # 因为"不是 OK"太宽——把读不到的环境问题一路报成 FAIL 也能骗过它，那正好是这项最坏的假绿。
     ("外部打开链路：命令缺参数位／指错文件必须 FAIL，其余坏法各自只能 WARN", j_openlink,
-     ({"external": {"platform": "win32", "gen_err": "", "winreg_err": "", "exe_exists": True,
+     (({"external": {"platform": "win32", "gen_err": "", "winreg_err": "", "exe_exists": True,
                     "launch_exe": "C:/r/luhui-player.exe", "progid": "LuHuiPlayer.Media",
                     "cmd": '"C:/r/luhui-player.exe" "%1"', "cmd_absent": False, "cmd_env": "",
                     "cmd_exe_exists": True,
-                    "ext_count": 48, "registered": 48, "missing": [], "env": []}}, OK),
+                    "ext_count": 48, "registered": 48, "missing": [], "env": []}},
+      {"external": {"platform": "win32", "gen_err": "", "winreg_err": "", "exe_exists": True,
+                    "launch_exe": "C:/r/luhui-player.exe", "progid": "LuHuiPlayer.Media",
+                    "cmd": '"C:/便携版/LuHui播放器.exe" "%1"', "cmd_absent": False,
+                    "cmd_env": "", "cmd_exe_exists": True,
+                    "ext_count": 48, "registered": 48, "missing": [], "env": []}}), OK),
      [({"external": {"platform": "win32", "exe_exists": True,
                       "launch_exe": "C:/r/luhui-player.exe",
                       "cmd": '"C:/r/luhui-player.exe"', "cmd_absent": False, "cmd_env": "",
@@ -1076,8 +1082,10 @@ def _judge(fn, facts: dict) -> tuple[str, str, str]:
 def falsify() -> int:
     miss = 0
     for name, fn, (good, want_good), bads in FALSIFY:
-        lv_g, seen_g, _ = _judge(fn, good)
-        ok_g = lv_g == want_good
+        # 好样本可以是一组：同一条判据的两种合法形态都得是同一个颜色。
+        goods = good if isinstance(good, tuple) else (good,)
+        levels = [_judge(fn, g)[0] for g in goods]
+        ok_g = all(lv == want_good for lv in levels)
         rows, crashed = [], []
         for b in bads:
             facts, expect = b[0], (b[1] if len(b) > 1 else None)
@@ -1088,7 +1096,8 @@ def falsify() -> int:
             rows.append(lv_b + ("" if hit else "≠"))
         caught = ok_g and not crashed and all("≠" not in r for r in rows)
         miss += 0 if caught else 1
-        print(f"[{'CAUGHT' if caught else 'MISSED'}] {name} —— 好样本={lv_g}（该 {want_good}）"
+        print(f"[{'CAUGHT' if caught else 'MISSED'}] {name} —— 好样本={'/'.join(levels)}"
+              f"（该 {want_good}）"
               f" 坏样本={rows}{' 崩了=' + str(crashed) if crashed else ''}")
     # 计数由这里自己数：手抄的"共 N 条"会在加样本那天变成假账（本项目的老规矩）
     print(f"\n证伪 {len(FALSIFY)} 组 —— CAUGHT {len(FALSIFY) - miss}／MISSED {miss}")

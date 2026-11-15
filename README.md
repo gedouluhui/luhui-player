@@ -34,6 +34,8 @@
 - **影厅级时间轴**：悬停出真实帧缩略图 + 时间气泡，章节标记、缓冲范围、A-B 循环可视化。
 - **字幕与画面**：内嵌/外挂字幕、双语、延迟微调；12 项几何与画质调整（旋转、裁剪、镜像、锐化、降噪、去色带）。
 - **单实例**：再次双击文件会转交给已开实例，不叠窗口。
+- **窗口不会跑出屏幕**：首次启动按主屏可用区居中，整窗（含标题栏）保证在屏内；你拖过的位置与
+  尺寸会记住，换屏或越界后自动收回，标题栏永远抓得住。全屏与改尺寸仍由你自己决定。
 - **便携**：onedir 打包，整个文件夹拷走即可运行；配置、缓存、截图都在文件夹内。
 
 ## 快速开始（源码）
@@ -147,13 +149,21 @@ packaging\reg\撤销打开方式注册.reg   :: 双击导入：只摘我们自�
 生成这两份的脚本自己**永远不写注册表**，导入那一下是用户决定（本机已于 2026-10-16 按用户授权导入过，
 要撤就双击上面那份撤销件）。导不导都随你，不导也不影响播放器本身。
 
+**便携版还有一条更省事的路**：把 `注册到打开方式.bat` 放在 `LuHui播放器.exe` 旁边双击，播放器会
+用**正在运行的这一份 exe** 自己登记（只写 HKCU，不碰 `UserChoice`、不改默认程序）；整个文件夹搬到
+别处后，在新位置再双击一次就修好了。撤销用 `撤销打开方式注册.bat`。这两份 bat 随便携版一起分发。
+
 导完怎么确认？注册表写没写到位、以及**外壳那份候选名单里有没有我们**，都可以不开窗口、不看屏幕地测：
 
 ```bat
 python tests\check_openwith.py --check        :: 现数注册表：模板里 58 条值一条条对，另查默认程序没被动过
 python tests\check_openwith_shell.py          :: 问 shell32 的枚举器：48 种扩展名的候选里有没有〈LuHui播放器〉
 python tests\e2e_openwith.py                  :: 端到端：照注册表里那条命令原样起一次，看画面与时间推进
+LuHui播放器.exe --openwith-status             :: 便携版自己报：命令指向哪份 exe、48 种格式登记了几种
 ```
+
+如果用的是便携版自登记，`check_openwith.py --check` 会拿源码模板去对、逐条报"不一致"——那是两套
+都合法的落点，不是坏了；以 `--openwith-status` 与 `check_openwith_shell.py` 的结果为准。
 
 三条都是 `rc=0` 算过。它们都不是恒绿的：第一条带 16 条已知好坏对照（`--selftest`），第二、三条带
 反向对照（`--expect-red`，故意喂个不可能的名字／坏路径，那本账必须翻红），第二条还另有一把尺子
@@ -255,7 +265,7 @@ python -m app.doctor --falsify   :: 开发者用：喂已知坏数据，每条�
 | 播到一半突然没了 | 未捕获异常导致进程 abort | `data\logs\crash.log`（这份日志就是为这一条存在的） |
 | GIF 导不出、缩略图空白 | 没装 ffmpeg | `app.doctor` 的「ffmpeg」 |
 | 某个键按了没反应 | 键位被改过或与其他键冲突 | `app.doctor --keys`，行尾会标「← 按不响」 |
-| 「打开方式」列表里没有它 | 注册模板还没导入（生成器不代劳） | 双击 `packaging\reg\注册到打开方式.reg`，再 `python tests\check_openwith.py --check` 与 `python tests\check_openwith_shell.py` 现数 |
+| 「打开方式」列表里没有它 | 还没登记（模板和便携版 bat 都需要你双击一次） | 便携版双击 `注册到打开方式.bat`；源码版双击 `packaging\reg\注册到打开方式.reg`。再跑 `check_openwith_shell.py` 现数 |
 | 换了目录/拷到别的机器打不开 | 路径与快捷方式过期 | `python packaging\make_shortcut.py` 重建，再重跑 `python packaging\make_launchers.py`（模板里的绝对路径来自当前解释器） |
 
 ---
@@ -398,7 +408,7 @@ python packaging\verify_runtime.py
 
 1. `python -m compileall -q app packaging tests`——全树编译检查；
 2. `python tests\ci_leak_scan.py`——发布前防泄漏，个人绝对路径一处都不许进仓库；
-3. `python tests\ci_offline.py`——离线回归全套（22 份脚本、361 条判据，强制 offscreen、每份独立数据目录与限时）。
+3. `python tests\ci_offline.py`——离线回归全套（23 份脚本、377 条判据，强制 offscreen、每份独立数据目录与限时）。
 
 需要真实 mpv、真 ffmpeg、本地改前留底或生成产物的脚本（`test_engine.py`、`test_ui.py`、`test_thumbs.py`、
 `test_library.py`、`test_instance.py`、`test_usage.py` 等）**不在 CI 里假装跑过**，留在本地按需执行；
@@ -473,6 +483,7 @@ python tests\audit_qt_attrs.py --selftest  :: 静态扫 Qt 成员写法在本机
 python tests\probe_surface_cover.py        :: 给侧栏加一页时跑它：逐屏体检那四处手抄名单（SURFACES／捕法／下标／widget_of）齐不齐；--falsify 7 处注入必须逐条点名。不建窗口、不写文件，屏幕睡着也跑。2026-10-13 起它同时被 `test_ui.py` 结构段那条对账腿调用（`PSC.load()`→`PSC.judges()`），所以不必再"记得单独跑才算数"；判据条数有下限，空表不许冒充全绿
 python packaging\make_launchers.py --selftest :: 启动脚本/启动器/两套 .reg 模板的 68 条已知好坏对照（2026-10-16 现数收尾行）
 python tests\test_launchers.py             :: 那七份文本产物加启动器真跑一遍（cmd 读 .bat、陌生 cwd 跑 open_file.py）；--falsify 把盘上产物改坏 18 条（同日发布数，CAUGHT 18／MISSED 0／NOP 0）
+python tests\test_openwith_register.py     :: 便携版自登记的正反判据（HKCU 临时子树）：写哪几根键、只摘自己、不碰 UserChoice
 python tests\check_openwith.py --check     :: 只读，现数注册表：模板里 58 条值逐条对＋默认程序（UserChoice 与扩展名默认值）没被动过；--selftest 16 条已知好坏对照
 python tests\check_openwith_shell.py       :: 问外壳自己的数据源 shell32!SHAssocEnumHandlers：48 种扩展名的候选名单里有没有〈LuHui播放器〉；--expect-red 是反向对照，本机这条判据的鉴别力口径见 §6 第 36 条
 python tests\falsify_openwith_shell.py     :: 给上面那条量具注入 4 处静默 bug，逐条要求当场翻红并点名

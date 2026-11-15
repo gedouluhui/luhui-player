@@ -173,6 +173,43 @@ def run_legs() -> list[tuple[str, bool, str]]:
     finally:
         drop(w3)
 
+    # 真机边框收口：WS_THICKFRAME/WS_CAPTION 是在 show 之后才加到 HWND 上的，
+    # Qt 按无边框窗排好的矩形会被 Windows 再撑大一圈（150% DPI 实测 +15×+37 逻辑像素），
+    # 于是底部/右侧整条伸出可用区。启动收口必须在边框落定后再落一次规划值。
+    cfg5 = make_cfg({"x": 637, "y": 46, "w": 1240, "h": 1429})
+    exp5 = win_geom.plan(cfg5["win_geom"], _qt_screens(), (1180, 720), (880, 560))
+    w5 = MainWindow(cfg5, files=[])
+    try:
+        w5.show()                       # 不 processEvents：先模拟"边框后到"
+        w5.resize(w5.width() + 15, w5.height() + 37)
+        settle = getattr(w5, "settle_start_geometry", None)
+        if settle is not None:
+            settle()
+        APP.processEvents()
+        ck("W10 show 之后边框把窗口撑大 → 启动收口把整窗拉回规划矩形（不再伸出可用区）",
+           exp5 is not None and w5.geometry().getRect() == tuple(exp5[:4]),
+           f"win={w5.geometry().getRect()} plan={exp5}")
+    finally:
+        drop(w5)
+
+    # 外部打开（双击文件 / 单实例转交）把已在跑的窗口带到眼前时，也要收回屏内：
+    # 用户拖到屏幕上方、标题栏够不着之后，下一次打开视频必须还能整窗看见。
+    cfg6 = make_cfg({"x": 100, "y": 80, "w": 1000, "h": 640})
+    w6 = MainWindow(cfg6, files=[])
+    try:
+        w6.show()
+        APP.processEvents()
+        w6.setGeometry(100, -300, 1000, 640)      # 标题栏整条在屏幕上方
+        exp6 = win_geom.plan({"x": 100, "y": -300, "w": 1000, "h": 640},
+                             _qt_screens(), (1180, 720), (880, 560))
+        w6.present_for_external()
+        APP.processEvents()
+        ck("W11 外部打开把跑出屏幕上方的窗口整窗收回（标题栏必须能再抓住）",
+           exp6 is not None and w6.geometry().getRect() == tuple(exp6[:4]),
+           f"win={w6.geometry().getRect()} plan={exp6}")
+    finally:
+        drop(w6)
+
     # 保存失败：只返回 False，不许抛（closeEvent 里抛 OSError = PyQt5 abort）
     bad = cfgmod.Config(path=os.path.join(DATA, "path-is-a-dir"))
     os.makedirs(bad.path, exist_ok=True)
@@ -243,6 +280,14 @@ def _no_restore(self):
     return None
 
 
+def _no_settle(self):
+    return None
+
+
+def _no_clamp(self):
+    return None
+
+
 MUTANTS = [
     ("X1 不夹横向（窗口留在屏幕外）", win_geom, "plan", _raw_x),
     ("X2 不夹尺寸（5000×3000 原样交给 Qt）", win_geom, "plan", _raw_size),
@@ -250,6 +295,9 @@ MUTANTS = [
     ("X4 屏外也不居中（留 5000,200）", win_geom, "plan", _no_center),
     ("X5 丢掉最大化位（重开变小窗）", win_geom, "plan", _drop_max),
     ("X6 构造期不恢复（存档形同虚设）", MainWindow, "_restore_geometry", _no_restore),
+    ("X7 show 后不再落一次（边框把窗口撑出可用区）", MainWindow, "settle_start_geometry",
+     _no_settle),
+    ("X8 外部打开不收回（标题栏留在屏幕上方）", MainWindow, "_clamp_visible", _no_clamp),
 ]
 
 

@@ -1,6 +1,6 @@
 """启动脚本、启动器 exe 与注册表模板的验收（一项都不看像素）+ 证伪。
 
-覆盖的是 packaging/make_launchers.py 那**七份文本产物加 luhui-player.exe**，而不是它的 lint：
+覆盖的是 packaging/make_launchers.py 那**九份文本产物加 luhui-player.exe**，而不是它的 lint：
 lint 的已知答案对照在 `python packaging/make_launchers.py --selftest` 里，条数由它自己打印
 （本文件只要求"没抓到 0 条"，**不抄它的条数**——抄了就会在下一轮加案例时变成滞后数字），
 而本文件第一件事就是把它当子进程跑一遍——判据没校准过，后面所有的绿都不算数。
@@ -58,12 +58,13 @@ ml = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ml)
 
 BAT_RUN, BAT_DOC, OPEN_PY = ml.BAT_RUN, ml.BAT_DOC, ml.OPEN_PY
+BAT_OW, BAT_OW_DEL = ml.BAT_OW, ml.BAT_OW_DEL
 REG_ADD, REG_DEL = ml.REG_ADD, ml.REG_DEL
 REG_OW, REG_OW_DEL = ml.REG_OW, ml.REG_OW_DEL
 LAUNCH_EXE, LAUNCH_CS = ml.LAUNCH_EXE, ml.LAUNCH_CS
 ALL5 = [BAT_RUN, BAT_DOC, OPEN_PY, REG_ADD, REG_DEL]
 # 文本产物全集（证伪的对照组与 md5 台账都数这份；启动器 exe 单独一条，它是二进制）
-ALLTEXT = ALL5 + [REG_OW, REG_OW_DEL]
+ALLTEXT = ALL5 + [REG_OW, REG_OW_DEL, BAT_OW, BAT_OW_DEL]
 
 results: list[tuple[str, bool, str]] = []
 
@@ -131,7 +132,8 @@ def items_bat(path: str, need: str) -> list[tuple[str, bool, str]]:
     if not txt:
         return [(f"{nm} 能用 GBK 解码（不是 UTF-8 存的）", False, err)]
     problems = ml.lint_bat(txt)
-    seg = [s for s in txt.split('"') if s.lower().endswith(".exe")]
+    # `%~dp0luhui-player.exe` 是运行时展开的，不拿它去判盘上存在；只盯写死的绝对路径。
+    seg = [s for s in txt.split('"') if s.lower().endswith(".exe") and "%" not in s]
     return [
         (f"{nm} 能用 GBK 解码（不是 UTF-8 存的）", True, f"{len(txt)} 字符"),
         # 这条也**不走 lint**：字节层面自己数一遍裸 LF，lint 恒真时这道闸还得会翻红。
@@ -142,8 +144,8 @@ def items_bat(path: str, need: str) -> list[tuple[str, bool, str]]:
          "；".join(problems)[:130]),
         (f"{nm} 先 cd 到脚本所在目录，且命令行里有「{need}」",
          'cd /d "%~dp0"' in txt and need in txt, need),
-        (f"{nm} 里写死的解释器真存在", bool(seg) and all(os.path.exists(s) for s in seg),
-         "、".join(seg)[:90]),
+        (f"{nm} 里写死的解释器真存在（自定位的不算）", all(os.path.exists(s) for s in seg),
+         "、".join(seg)[:90] or "没有写死的 exe，全部 %~dp0 自定位"),
     ]
 
 
@@ -578,6 +580,8 @@ def check_all() -> None:
            or f"{len(ALLTEXT)} 份加启动器都在且一致")])
     emit(items_bat(BAT_RUN, "%*"))
     emit(items_bat(BAT_DOC, "-m app.doctor"))
+    emit(items_bat(BAT_OW, "--register-openwith"))
+    emit(items_bat(BAT_OW_DEL, "--unregister-openwith"))
     a, _ = read_gbk(BAT_RUN)
     b, _ = read_gbk(BAT_DOC)
     emit([("启动那条用 pythonw（双击不带黑窗），自检那条用带控制台的 python",
@@ -725,6 +729,8 @@ def falsify() -> int:
     owd_txt, _, _ = reg_text(REG_OW_DEL)
     run_txt, _ = read_gbk(BAT_RUN)
     doc_txt, _ = read_gbk(BAT_DOC)
+    ow_bat_txt, _ = read_gbk(BAT_OW)
+    owd_bat_txt, _ = read_gbk(BAT_OW_DEL)
     op_txt, _ = read_utf8(OPEN_PY)
     cs_txt = _disk_text(LAUNCH_CS, "ascii")
     esc_exe = ml._reg_escape(ml.LAUNCH_EXE)
@@ -785,6 +791,12 @@ def falsify() -> int:
         ("撤销件的摘值行写成清空而不是按名字删", REG_OW_DEL,
          owd_txt.replace(f'"{ml.PROGID}"=-', f'"{ml.PROGID}"=""'), "reg",
          ("不是一条按名字的删除",), mine_owd),
+        ("登记 .bat 换成 LF 行尾（cmd 会把中文行劈开）", BAT_OW,
+         ow_bat_txt.replace("\r\n", "\n"), "gbk", ("裸 LF",),
+         lambda: items_bat(BAT_OW, "--register-openwith")),
+        ("撤销 .bat 里丢了自己的旗标（只会重新登记）", BAT_OW_DEL,
+         owd_bat_txt.replace("--unregister-openwith", "--register-openwith"), "gbk",
+         ("不一致",), lambda: items_bat(BAT_OW_DEL, "--unregister-openwith")),
         ("launcher.cs 改了没重编（exe 与源不是同一份）", LAUNCH_CS,
          cs_txt.replace("Gelu Player", "Gelu Player X"), "ascii", ("不一致",), items_launcher),
     ]
@@ -836,10 +848,11 @@ def main(argv: list[str]) -> int:
           + (f"：{'；'.join(fails)}" if fails else ""))
     if not fails:
         print("本文件只验字节，没碰注册表。要「打开方式」里出现播放器就双击 "
-              r"packaging\reg\注册到打开方式.reg"
-              "（只写 HKCU\\Software\\Classes，不动默认打开方式）；想撤就双击 "
-              r"packaging\reg\撤销打开方式注册.reg"
-              "。导入之后用 python tests/check_openwith.py --check 核对注册表现数。")
+              r"注册到打开方式.bat"
+              "（播放器自己登记自己，只写 HKCU\\Software\\Classes，不动默认打开方式）；想撤就双击 "
+              r"撤销打开方式注册.bat"
+              "。仓库里那份 .reg 是给不想跑 exe 的人准备的同一套键；"
+              "导入之后用 python tests/check_openwith.py --check 核对注册表现数。")
     return 1 if fails else 0
 
 

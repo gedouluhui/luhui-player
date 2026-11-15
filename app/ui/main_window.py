@@ -223,12 +223,22 @@ class MainWindow(QWidget):
         # 几何记忆（ui/win_geom.py）：`_geom_save_timer` 只在拖动/缩放**停下来**之后
         # 落盘，拖动途中一次都不写——否则一次拖窗就是几十次整份 config 写盘。
         self._start_max = False         # 启动时是否按存档恢复最大化（showEvent 里消费一次）
+        self._start_rect = None         # 启动规划矩形：原生边框落定后再落一次（见 settle_start_geometry）
         self._geom_pre_fs = None        # 进全屏前的普通态矩形（全屏中关窗时用它存档）
         self._max_pre_fs = False
         self._geom_save_timer = QTimer(self)
         self._geom_save_timer.setSingleShot(True)
         self._geom_save_timer.setInterval(1200)
         self._geom_save_timer.timeout.connect(self._save_geometry)
+        # 启动矩形的第二落点。showEvent 里的 QTimer.singleShot(0, ...) 跑在 Qt 的
+        # show 序列和边框落定之前，随后那次布局会把窗口重新撑大（真机实测：规划
+        # 1240×1392，落成后变成 1255×1429，底边伸出可用区 56 物理像素）；show()
+        # 之后的同步调用同样太早，还会消费掉收口目标。等一拍（60ms）再落才稳定，
+        # 用户看到的是规划好的矩形。
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(60)
+        self._settle_timer.timeout.connect(self.settle_start_geometry)
 
         self.player = MpvPlayer(cfg, self)
         self._files = list(files or [])
@@ -503,6 +513,10 @@ class MainWindow(QWidget):
             # 只消费一次——用户之后手动还原，不许每次 show 又被拽回最大化。
             self._start_max = False
             QTimer.singleShot(0, self._restore_maximized)
+        elif self._start_rect is not None:
+            # 普通态：边框样式是 show 时才加到 HWND 上的，规划值必须在边框落定后再落一次，
+            # 否则 Windows 会把窗口再撑大一圈（真机 150% DPI 实测 +15×+37 逻辑像素）。
+            self._settle_timer.start()
         if self._files:
             files, self._files = self._files, []
             QTimer.singleShot(0, lambda: self.add_paths(files))
@@ -540,6 +554,7 @@ class MainWindow(QWidget):
             return
         self._fs = False
         self._apply_mode()
+        QTimer.singleShot(0, self._clamp_visible)
         QTimer.singleShot(0, self._save_geometry)
         self._sync_geometry_save_timer()
 
@@ -579,11 +594,56 @@ class MainWindow(QWidget):
         # minimumSize 弹回去，又变成"有一截在屏幕外"。
         self.setMinimumSize(min(MIN_W, max(1, w)), min(MIN_H, max(1, h)))
         self.setGeometry(x, y, w, h)
+        self._start_rect = (x, y, w, h)
         self._start_max = bool(maxed)
+
+    def settle_start_geometry(self) -> None:
+        """show 之后把启动规划矩形再落一次。
+
+        `chrome.install()` 在 showEvent 里才给 HWND 加 WS_THICKFRAME/WS_CAPTION；
+        Qt 之前是按无边框窗排的，边框生效后 Windows 会按客户区把整窗再撑大一圈
+        （真机 150% DPI 实测 +15×+37 逻辑像素），底部/右侧就伸出可用区。
+        边框落定后再 setGeometry，得到的才是规划器算好的整窗矩形。由 showEvent
+        启动的 60ms 计时器调用——0ms（包括 show() 返回后同步调）都会被随后的
+        显示序列覆盖，实测反而把窗口撑出屏幕。
+        """
+        self._settle_timer.stop()
+        rect, self._start_rect = self._start_rect, None
+        if rect is None or self._fs or self.isMaximized() or not self.isVisible():
+            return
+        self.setGeometry(*rect)
+
+    def _clamp_visible(self) -> None:
+        """把普通态窗口整窗收回可用区（外部打开 / 退出最大化或全屏时调用）。
+
+        用户把标题栏拖到屏幕上方之后，下一次双击视频还得能抓住窗；全屏/最大化不碰，
+        位置由系统管。规划器选"交集最大的屏"，完全不在任何屏上就回主屏正中。
+        """
+        if self._fs or self.isFullScreen() or self.isMaximized() or not self.isVisible():
+            return
+        try:
+            g = self.geometry().getRect()
+            screens = win_geom.from_qt(QApplication)
+            fixed = win_geom.plan({"x": g[0], "y": g[1], "w": g[2], "h": g[3]},
+                                  screens, (1180, 720), (MIN_W, MIN_H))
+        except Exception as exc:                       # 读屏失败不许拖垮外部打开
+            print(f"[win_geom] 收回失败：{type(exc).__name__}: {exc}", file=sys.stderr)
+            return
+        if not fixed:
+            return
+        x, y, w, h, _ = fixed
+        self.setMinimumSize(min(MIN_W, max(1, w)), min(MIN_H, max(1, h)))
+        if (x, y, w, h) != tuple(g):
+            self.setGeometry(x, y, w, h)
 
     def _restore_maximized(self) -> None:
         if self._fs:
             return
+        if self._start_rect is not None:
+            # 最大化前先把（边框落定后的）普通态矩形纠正回来：以后还原时窗口
+            # 按这个矩形回来，不会再带着一圈伸出屏幕的边框。
+            self.setGeometry(*self._start_rect)
+            self._start_rect = None
         self.showMaximized()
         self.title.set_maximized(True)
         QTimer.singleShot(80, self.video.refit)
@@ -630,6 +690,9 @@ class MainWindow(QWidget):
             self.showFullScreen()
         elif self.isMinimized():
             self.showNormal()
+        # 窗口在上一段使用里可能被拖到屏幕上方/外侧：带回眼前时必须还能看见标题栏，
+        # 否则用户点开视频后只得到一扇拖不动的窗。
+        self._clamp_visible()
         self.activateWindow()
         self.video.refit()
 
@@ -1119,6 +1182,7 @@ class MainWindow(QWidget):
         if not self._fs:
             self._geom_pre_fs = None
             self._max_pre_fs = False
+            QTimer.singleShot(0, self._clamp_visible)   # 退出全屏落回普通态也收回屏幕内
             QTimer.singleShot(0, self._save_geometry)
         self._sync_geometry_save_timer()
 
@@ -1236,6 +1300,7 @@ class MainWindow(QWidget):
     def _toggle_max(self) -> None:
         if self.isMaximized():
             self.showNormal()
+            QTimer.singleShot(0, self._clamp_visible)   # 还原后的普通态也收回屏幕内
         else:
             self.showMaximized()
         self.title.set_maximized(self.isMaximized())
