@@ -162,7 +162,7 @@ def main() -> int:
     first, last = samples[0], samples[-1]
     summary = {
         "rounds": ROUNDS,
-        "exe": EXE,
+        "exe": os.path.relpath(EXE, ROOT) if EXE.startswith(ROOT) else os.path.basename(EXE),
         "handles_first": first["handles"],
         "handles_last": last["handles"],
         "handles_median": statistics.median(handles),

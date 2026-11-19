@@ -1,6 +1,6 @@
 {
   "rounds": 50,
-  "exe": "C:\\Users\\lyj20\\Desktop\\LuHui\u64ad\u653e\u5668\\LuHui\u64ad\u653e\u5668.exe",
+  "exe": "<package>/LuHui播放器.exe",
   "handles_first": 293,
   "handles_last": 277,
   "handles_median": 293.0,
