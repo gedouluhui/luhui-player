@@ -50,3 +50,7 @@ docs/交账-*.md
 .idea/
 Thumbs.db
 desktop.ini
+
+# 本轮临时构建目录
+dist_new/
+build_new/
