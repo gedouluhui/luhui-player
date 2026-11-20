@@ -5,6 +5,7 @@
 **Windows 本地视频播放器 —— mpv 解码内核 + PyQt5 自绘 Fluent 外壳。**
 
 <p>
+<img alt="ci" src="https://github.com/gedouluhui/luhui-player/actions/workflows/ci.yml/badge.svg">
 <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey">
 <img alt="license" src="https://img.shields.io/badge/license-GPL--3.0-blue">
 <img alt="core" src="https://img.shields.io/badge/decoder-mpv-informational">
